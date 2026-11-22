@@ -127,6 +127,10 @@ _NOTHING_TO_LEAK = {
     # Derives a root and a label from a config; the only refusal is the constructor's blank-label
     # check, which names no caller value.
     "SourceLibrary.for_engagement",
+    # Returns a `ToolResult` rather than raising, so it has no message for this sweep to poison.
+    # Covered instead by `test_a_read_refusal_echoes_no_document_id` below, which asserts on the
+    # result's content and on what lands in `unread_reasons`.
+    "ReadDocumentTool.run",
 }
 
 #: Which member each sweep case exercises. The sweep is hand-written -- a generic fuzzer cannot
@@ -172,12 +176,16 @@ def test_every_member_that_takes_input_is_swept() -> None:
     `inspect.isfunction`, both missed a deliberately leaky classmethod without a failure.
     """
     from tests.test_sponsor_surface import _public_callables
+    from workbench.coordinator.tools import ReadDocumentTool
     from workbench.core.sources import SourceLibrary as Library
     from workbench.core.store import Store
 
+    # `ReadDocumentTool` is in the sweep's scope because it is the one place a MODEL's own text
+    # reaches a message: it was missing, and that is how a `doc_id` carrying a newline got as far
+    # as forging a line in `wb discover`'s coverage block.
     members = {
         f"{owner.__name__}.{name}"
-        for owner in (Store, Library)
+        for owner in (Store, Library, ReadDocumentTool)
         for name in _public_callables(owner)
     }
     uncovered = members - set(_COVERED.values()) - _NOTHING_TO_LEAK
@@ -255,3 +263,29 @@ def test_a_workbench_error_answers_for_itself(tmp_path: Path) -> None:
         assert classify(exc) == (exc.category, exc.retryable)
     else:  # pragma: no cover - the read above always refuses
         pytest.fail("the escape was not refused")
+
+
+def test_a_read_refusal_echoes_no_document_id(fixture: Fixture) -> None:
+    """`ReadDocumentTool.run` answers with a `ToolResult`, not an exception, so the sweep above
+    cannot poison it -- but it is the one place a model's own text reaches a message, and that is
+    how an id carrying a newline reached `wb discover`'s coverage block. Asserted directly."""
+    import asyncio
+
+    from agent_container.core.tool import ToolContext
+
+    from workbench.coordinator.tools import OFF_MANIFEST, ReadDocumentTool
+
+    refs = fixture.store.index_sources(
+        fixture.store.load_principal("analyst-rao", Role.ANALYST), ACME, fixture.acme_library
+    )
+    reader = ReadDocumentTool(
+        fixture.acme_library, {refs[0].doc_id: refs[0].path}, char_budget=20_000
+    )
+    invented = f"doc-{MARKER}-00000000".replace("_", "-")
+    refused = asyncio.run(
+        reader.invoke({"doc_id": invented}, ToolContext(run_id="r", turn=1, tool_use_id="t"))
+    )
+    assert refused.is_error is True
+    assert MARKER not in refused.content
+    assert list(reader.unread_reasons) == [OFF_MANIFEST]
+    assert MARKER not in reader.unread_reasons[OFF_MANIFEST]
