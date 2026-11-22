@@ -22,7 +22,7 @@ from workbench.coordinator.coordinator import DiscoveryCoordinator, DiscoveryRun
 from workbench.coordinator.providers import LiveSource, ProviderSource, ReplaySource
 from workbench.core.config import Config
 from workbench.core.errors import WorkbenchError
-from workbench.core.principals import Action, EngagementState, Principal, Resource, Role, assert_can
+from workbench.core.principals import EngagementState, Principal, Role
 from workbench.core.store import Store
 
 #: The committed recording. Beside this package's code, so the wheel carries it.
@@ -88,11 +88,13 @@ def _source(
         return ReplaySource.from_file(FIXTURE)
     # `--live` is an action, checked like any other. Reading the engagement first means the check
     # sees its real state and that the principal is assigned to it.
+    # Read the engagement first so the check sees its real state and that this principal is
+    # assigned to it; `LiveSource` itself calls `assert_can(RUN_LIVE)`, so forgetting that line
+    # here could not open the live path.
     engagement = store.engagement(principal, engagement_id)
-    assert_can(
-        principal, Action.RUN_LIVE, Resource(engagement.id, EngagementState(engagement.state))
+    return LiveSource(
+        Config.from_env(), principal, engagement.id, EngagementState(engagement.state)
     )
-    return LiveSource(Config.from_env())
 
 
 def _report(result: DiscoveryRun) -> None:

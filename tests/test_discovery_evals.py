@@ -23,6 +23,7 @@ from tests.conftest_pack import (
     MATCHING,
     NO_DUPES,
     NO_EXCEPTION_QUEUE,
+    NORTHWIND,
     PACK_ROOT,
     POLICY,
     RECEIVING,
@@ -32,6 +33,7 @@ from tests.recordings import answer, answering_specialist, finding, recording_so
 from workbench.coordinator.coordinator import DiscoveryRun
 from workbench.coordinator.providers import ProviderSource, ReplaySource
 from workbench.coordinator.schemas import Plan, PlannedQuestion, Specialist
+from workbench.coordinator.tools import OFF_MANIFEST
 from workbench.core.errors import CoverageGapsPresent
 from workbench.core.principals import Principal, Role
 from workbench.core.sources import SourceLibrary
@@ -99,15 +101,47 @@ def test_a_different_engagement_gets_a_different_plan(
 
     On recorded replies the model's own choice cannot be observed, so what is asserted is the thing
     the coordinator controls and the thing the model is given: the planner's **input** differs
-    between the two seeded engagements -- a different brief and a disjoint document index -- and
-    neither engagement's documents appear in the other's prompt. A plan cannot be adaptive to
-    something it was never shown.
-    """
-    from workbench.coordinator.coordinator import DiscoveryCoordinator
+    between the two seeded engagements -- a different brief and a disjoint, non-empty document
+    index -- and neither engagement's documents appear in the other's prompt. A plan cannot be
+    adaptive to something it was never shown.
 
-    other = tmp_path / "northwind-sources" / "northwind-ar"
-    other.mkdir(parents=True)
-    (other / "ar-notes.md").write_text("# AR notes\n\nRemittance is retyped.\n", encoding="utf-8")
+    Both indexes must be **real and non-empty**. An earlier version built the second message from
+    an empty index, which made "none of Acme's documents appear in Northwind's prompt" true for
+    every possible implementation: a test that could not fail.
+    """
+    from datetime import UTC, datetime
+    from itertools import count
+
+    from workbench.coordinator.coordinator import DiscoveryCoordinator
+    from workbench.core.config import Config
+    from workbench.core.store import Store
+
+    # Northwind has no committed pack, so give it one -- in its own store, because 20.2's library
+    # guard (rightly) refuses a library rooted outside the store's configured source root. Two
+    # stores is the honest way to have two real indexes.
+    other_root = tmp_path / "northwind-sources"
+    (other_root / NORTHWIND).mkdir(parents=True)
+    (other_root / NORTHWIND / "ar-notes.md").write_text(
+        "# AR notes\n\nRemittance advice is retyped by the AR clerk.\n", encoding="utf-8"
+    )
+    other_config = Config(database_path=tmp_path / "northwind.sqlite3", sources_root=other_root)
+    ids = count(1)
+    with Store.open(
+        other_config,
+        now=lambda: datetime(2026, 11, 22, 6, 0, tzinfo=UTC),
+        new_id=lambda: f"nw-{next(ids):04d}",
+    ) as other_store:
+        other_store.build()
+        northwind = other_store.load_principal("analyst-shaw", Role.ANALYST)
+        northwind_index = other_store.index_sources(
+            northwind, NORTHWIND, SourceLibrary.for_engagement(other_config, NORTHWIND)
+        )
+        northwind_brief = other_store.engagement(northwind, NORTHWIND).brief
+        northwind_message = DiscoveryCoordinator(
+            other_store, other_config, ReplaySource.from_file(FIXTURE)
+        )._plan_message(northwind_brief, northwind_index)
+
+    assert northwind_index, "the second index must be real, or the disjointness proves nothing"
 
     coordinator = DiscoveryCoordinator(pack.store, pack.config, ReplaySource.from_file(FIXTURE))
     acme_index = pack.store.index_sources(
@@ -116,15 +150,22 @@ def test_a_different_engagement_gets_a_different_plan(
     acme_brief = pack.store.engagement(pack_analyst, ACME).brief
     acme_message = coordinator._plan_message(acme_brief, acme_index)
 
-    northwind = pack.principal("analyst-shaw", Role.ANALYST)
-    northwind_brief = pack.store.engagement(northwind, "northwind-ar").brief
-    northwind_message = coordinator._plan_message(northwind_brief, ())
-
     assert acme_brief != northwind_brief
     assert acme_message != northwind_message
+    # Each prompt carries its own brief and its own documents...
+    assert acme_brief in acme_message
+    assert northwind_brief in northwind_message
+    for ref in acme_index:
+        assert ref.doc_id in acme_message
+    for ref in northwind_index:
+        assert ref.doc_id in northwind_message
+    # ...and neither carries the other's.
     assert northwind_brief not in acme_message
+    assert acme_brief not in northwind_message
     for ref in acme_index:
         assert ref.doc_id not in northwind_message
+    for ref in northwind_index:
+        assert ref.doc_id not in acme_message
 
 
 # ---- eval 2: the planted injection ----------------------------------------------------------
@@ -220,9 +261,12 @@ def test_an_injected_instruction_cannot_reach_a_document_it_was_not_given(
     result = _discover(pack, pack_analyst, source)
     (outcome,) = result.outcomes
     assert outcome.state == "ok"
-    # The refusal is recorded against the document it asked for, and nothing from it was served.
-    assert CLERK in outcome.unread
-    assert outcome.unread[CLERK] == "this question does not name that document"
+    # The refusal is recorded, and nothing from the document it asked for was served. It is
+    # recorded under a FIXED key, not under the id it asked for: the id a subagent names is
+    # model-chosen text, and this record is what `wb discover`'s coverage block is rendered from.
+    assert OFF_MANIFEST in outcome.unread
+    assert CLERK not in outcome.unread
+    assert "does not name" in outcome.unread[OFF_MANIFEST]
     assert all(claim.doc_id == RECEIVING for claim in result.claims)
 
 

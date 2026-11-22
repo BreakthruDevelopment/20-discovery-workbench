@@ -24,6 +24,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from workbench.core.config import Config
 from workbench.core.errors import InvalidInput, ProviderFailed, Throttled
+from workbench.core.principals import Action, EngagementState, Principal, Resource, assert_can
 
 #: At most this many model calls in flight at once on the live path. Four is app 17's own default
 #: and is below the fan-out the plan can ask for, which is the point.
@@ -120,11 +121,21 @@ class ReplaySource:
 
 
 class LiveSource:
-    """Bedrock behind app 17's rate limiter. Reached only by an explicit, `lead`-only `--live`."""
+    """Bedrock behind app 17's rate limiter. Reached only by an explicit, `lead`-only `--live`.
 
-    def __init__(self, config: Config) -> None:
+    **The `lead`-only check is here, not in the caller.** This repo's `AGENTS.md` puts access
+    checks inside the layer that holds the capability, and the capability a `LiveSource` holds is
+    "this run may spend money at Bedrock". A check in `wb discover` would be one copy per entry
+    point, and 20.6 adds a second (`wb demo --live`) -- so constructing one of these without the
+    right principal must be what fails, rather than forgetting a line at a call site.
+    """
+
+    def __init__(
+        self, config: Config, principal: Principal, engagement_id: str, state: EngagementState
+    ) -> None:
         from agent_container.core.bedrock import BedrockProvider
 
+        assert_can(principal, Action.RUN_LIVE, Resource(engagement_id, state))
         model = config.live_model_reference()
         self._shared = RateLimitedProvider(
             BedrockProvider(model_id=model, region_name=config.region),

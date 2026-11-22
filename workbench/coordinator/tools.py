@@ -25,12 +25,17 @@ from __future__ import annotations
 from collections.abc import Mapping
 
 from agent_container.core.tool import Effect, ErrorCategory, Tool, ToolContext, ToolResult
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict
 
 from workbench.core.errors import WorkbenchError
 from workbench.core.sources import SourceLibrary
 
-from .schemas import Answer, Plan
+from .schemas import Answer, DocId, Plan
+
+#: The key a refusal is recorded under when a subagent asks for a document its question never
+#: named. A fixed string, because the id it asked for is model-chosen text and belongs nowhere
+#: near the record `wb discover`'s coverage block is rendered from.
+OFF_MANIFEST = "(a document outside this question)"
 
 
 class _ReadArgs(BaseModel):
@@ -38,7 +43,10 @@ class _ReadArgs(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    doc_id: str = Field(min_length=1, max_length=256)
+    #: Pattern-constrained, not merely length-bounded. A `doc_id` is model-chosen text that
+    #: reaches an operator's terminal through `wb discover`'s coverage block, and an id carrying a
+    #: newline forged a `GAP` line there. See `schemas.DOC_ID_PATTERN`.
+    doc_id: DocId
 
 
 class ReadDocumentTool(Tool[_ReadArgs]):
@@ -86,6 +94,9 @@ class ReadDocumentTool(Tool[_ReadArgs]):
         self._share = max(1, char_budget // max(1, len(self._paths)))
         self._chars_served = 0
         self._served: dict[str, int] = {}
+        #: doc_id -> why it was not read in full. Keyed by a document id only where that id is
+        #: one this question actually named, which makes it a store-derived value. An id the
+        #: subagent invented is recorded under `OFF_MANIFEST`.
         self.unread_reasons: dict[str, str] = {}
 
     @property
@@ -113,7 +124,9 @@ class ReadDocumentTool(Tool[_ReadArgs]):
         if path is None:
             # `permission`, not `validation`: the id may well be a real document of this
             # engagement. It is not one this question named, and that will not change.
-            self.unread_reasons[args.doc_id] = "this question does not name that document"
+            self.unread_reasons[OFF_MANIFEST] = (
+                "a document this question does not name was asked for"
+            )
             return ToolResult.error(
                 ErrorCategory.PERMISSION,
                 "this question does not name that document; read only the ids in the question",

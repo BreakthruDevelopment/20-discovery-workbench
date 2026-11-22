@@ -15,8 +15,9 @@ difference between well-shaped and true.
 from __future__ import annotations
 
 from enum import StrEnum
+from typing import Annotated
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 #: At most six questions in a plan (spec, `discovery-plan`). More than six is a rejected plan.
 MAX_QUESTIONS = 6
@@ -31,6 +32,36 @@ MAX_RATIONALE_CHARS = 1_000
 MAX_CLAIM_CHARS = 2_000
 MAX_QUOTE_CHARS = 2_000
 MAX_NOTE_CHARS = 2_000
+
+#: What a document id may contain. Derived ids are `doc-<engagement>--<slug>-<digest>`, so this is
+#: generous -- and it is here because a `doc_id` is **model-chosen text** that reaches an operator's
+#: terminal. Unconstrained, a subagent could name a document
+#: `"x\n  GAP  q9 (process): none, retryable=false"` and forge a line inside `wb discover`'s
+#: coverage block, which is the product. A pattern with no newline in it is the fix; keeping the id
+#: out of the record where it is not ours is the other half (see `tools.py`).
+DOC_ID_PATTERN = r"\A[A-Za-z0-9._-]{1,256}\z"
+
+#: A document id as a field type. `Annotated` on the ITEM, because `pattern=` on a `list[str]`
+#: field is applied to the list and raises `TypeError` out of `model_validate` -- which escapes
+#: app 17's `Tool.invoke`, since that catches `ValidationError` only, so the whole loop dies
+#: instead of handing the model a validation result it could fix.
+DocId = Annotated[str, Field(min_length=1, max_length=256, pattern=DOC_ID_PATTERN)]
+
+
+def _clean_text(value: str, field: str) -> str:
+    """Trim, and refuse blank or NUL-bearing text.
+
+    `min_length=1` passes `"   "`, which then reached `store.record_claims` and raised
+    `InvalidInput` from inside the recording loop -- aborting a run whose questions were already
+    persisted and leaving them with no `subagent_run` row at all. A model answer is validated here,
+    at the boundary, so the store's own refusal stays the backstop it should be.
+    """
+    trimmed = value.strip()
+    if not trimmed:
+        raise ValueError(f"{field} is blank")
+    if "\x00" in trimmed:
+        raise ValueError(f"{field} contains a NUL byte")
+    return trimmed
 
 
 class Specialist(StrEnum):
@@ -55,8 +86,13 @@ class PlannedQuestion(_Strict):
     specialist: Specialist
     #: At least one document, because a question naming none is a question no subagent can answer
     #: from evidence -- which is the only kind this app asks.
-    doc_ids: list[str] = Field(min_length=1, max_length=32)
+    doc_ids: list[DocId] = Field(min_length=1, max_length=32)
     rationale: str = Field(min_length=1, max_length=MAX_RATIONALE_CHARS)
+
+    @field_validator("text", "rationale")
+    @classmethod
+    def _not_blank(cls, value: str) -> str:
+        return _clean_text(value, "a planned question's text")
 
 
 class Plan(_Strict):
@@ -70,10 +106,15 @@ class Finding(_Strict):
     """One thing a subagent says it found, with the quote that is supposed to support it."""
 
     claim: str = Field(min_length=1, max_length=MAX_CLAIM_CHARS)
-    doc_id: str = Field(min_length=1, max_length=256)
+    doc_id: DocId
     quote: str = Field(min_length=1, max_length=MAX_QUOTE_CHARS)
     confidence: float = Field(ge=0.0, le=1.0)
     uncertainty: str = Field(default="", max_length=MAX_NOTE_CHARS)
+
+    @field_validator("claim", "quote")
+    @classmethod
+    def _not_blank(cls, value: str) -> str:
+        return _clean_text(value, "a finding's text")
 
 
 class Answer(_Strict):
@@ -85,4 +126,4 @@ class Answer(_Strict):
     insufficient_evidence: bool = False
     #: Documents it could not read in full, with the reason -- which comes from the source
     #: library's stated `unread_reason`, not from the model's imagination.
-    unread: list[str] = Field(default_factory=list, max_length=32)
+    unread: list[DocId] = Field(default_factory=list, max_length=32)

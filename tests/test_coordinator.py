@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from typing import cast
 
 import pytest
 from agent_container.core.budget import Budget
@@ -34,8 +35,10 @@ from workbench.coordinator.coordinator import (
 from workbench.coordinator.providers import ReplaySource
 from workbench.coordinator.schemas import MAX_QUESTIONS, Answer, Plan, PlannedQuestion, Specialist
 from workbench.coordinator.tools import ReadDocumentTool
+from workbench.core.errors import InvalidInput
 from workbench.core.principals import Principal
 from workbench.core.sources import SourceLibrary
+from workbench.core.store import Store
 
 
 def _run(pack: Pack, principal: Principal, engagement_id: str = ACME) -> DiscoveryRun:
@@ -544,3 +547,81 @@ def test_no_subagent_is_starved_by_a_sibling_s_reading(tmp_path: Path) -> None:
                 f"q{outcome.seq} read nothing: {reason}"
             )
             assert "share of the per-answer reading budget" in reason, (doc_id, reason)
+
+
+# ---- recording is isolated per question ----------------------------------------------------
+
+
+def test_a_finding_the_store_refuses_costs_only_its_own_question(
+    pack: Pack, pack_analyst: Principal
+) -> None:
+    """A refusal inside `record_claims` used to abort the run from the recording loop, leaving
+    every already-persisted question with no `subagent_run` row -- including a sibling that had
+    answered successfully. The same half-written state the cancelled-gather handler prevents, by a
+    different route, and 20.5 reads exactly these rows.
+
+    The schema now rejects a blank or NUL-bearing finding before it reaches the store, so this
+    drives the remaining route: a document that becomes unreadable between the read and the
+    verification, which makes `record_claims` refuse the batch.
+    """
+    plan = {
+        "questions": [
+            {
+                "text": f"Question {n}: how is matching done?",
+                "specialist": "process",
+                "doc_ids": [CLERK],
+                "rationale": "the clerk describes it",
+            }
+            for n in (1, 2)
+        ],
+        "strategy_note": "two questions",
+    }
+    source = recording_source(
+        plan_payload=plan,
+        specialists={
+            "1": answering_specialist(
+                [CLERK],
+                answer([finding(claim="Matching is manual.", doc_id=CLERK, quote=MATCHING)]),
+            ),
+            "2": answering_specialist(
+                [CLERK],
+                answer([finding(claim="Matching is manual.", doc_id=CLERK, quote=MATCHING)]),
+            ),
+        },
+    )
+
+    # Make the store's claim recording refuse, for every question, from inside the loop.
+    class _Refusing:
+        def __init__(self, inner: object) -> None:
+            self._inner = inner
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self._inner, name)
+
+        def record_claims(self, *args: object, **kwargs: object) -> object:
+            raise InvalidInput("the store refuses this batch")
+
+    coordinator = DiscoveryCoordinator(cast("Store", _Refusing(pack.store)), pack.config, source)
+    result = asyncio.run(coordinator.discover(pack_analyst, ACME, budget=_budget()))
+
+    # The run completed, and BOTH questions have a row -- neither lost to the other's refusal.
+    assert [o.state for o in result.outcomes] == ["failed", "failed"]
+    questions = pack.store.questions(pack_analyst, ACME)
+    runs = pack.store.subagent_runs(pack_analyst, ACME)
+    assert len(questions) == 2
+    assert len(runs) == 2
+    assert set(pack.store.failed_run_question_ids(pack_analyst, ACME)) == {
+        question.id for question in questions
+    }
+
+
+def test_a_run_reports_only_its_own_claims(pack: Pack, pack_analyst: Principal) -> None:
+    """`claims()` returns the engagement's whole history, so a second run printed "claims: 14
+    verified" for a run that produced seven -- the figure an operator reads off the coverage
+    block, wrong by however many runs came before."""
+    first = _run(pack, pack_analyst)
+    second = _run(pack, pack_analyst)
+    assert len(first.claims) == len(second.claims)
+    assert len(second.verified_claims) == len(first.verified_claims)
+    # And the engagement really does hold both runs' worth.
+    assert len(pack.store.claims(pack_analyst, ACME)) == len(first.claims) + len(second.claims)

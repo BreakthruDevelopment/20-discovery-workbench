@@ -35,6 +35,7 @@ time, which a demo needs.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 
@@ -155,7 +156,16 @@ class DiscoveryCoordinator:
 
         questions = self._store.record_questions(principal, engagement_id, kept)
         outcomes = await self._answer_all(principal, engagement_id, questions, library, budget)
-        claims = self._store.claims(principal, engagement_id)
+        # THIS run's claims, not the engagement's. `claims()` returns every claim the engagement
+        # has ever had, so a second `wb discover` printed "claims: 14 verified" for a run that
+        # produced seven -- the number an operator reads off the coverage block, wrong by however
+        # many runs came before.
+        mine = {question.id for question in questions}
+        claims = tuple(
+            claim
+            for claim in self._store.claims(principal, engagement_id)
+            if claim.question_id in mine
+        )
         return DiscoveryRun(
             engagement_id=engagement_id,
             strategy_note=plan.strategy_note,
@@ -337,10 +347,15 @@ class DiscoveryCoordinator:
             )
             try:
                 result = await agent.run(_specialist_message(question), budget.child())
+            except (KeyboardInterrupt, SystemExit):
+                # Not a subagent failure: the operator or the process is stopping. Recording it as
+                # a `transient, retryable` row and carrying on with the fan-out would turn Ctrl-C
+                # into a run that looks merely unlucky.
+                raise
             except BaseException as exc:
-                # Deliberately `BaseException`: `asyncio.CancelledError` derives from it, and a
-                # cancelled subagent that escaped unrecorded would be the one failure mode this
-                # slice exists to make impossible. Every failure becomes a `subagent_run` row.
+                # Otherwise deliberately `BaseException`: `asyncio.CancelledError` derives from it,
+                # and a cancelled subagent that escaped unrecorded would be the one failure mode
+                # this slice exists to make impossible. Every failure becomes a row.
                 return _Attempt(question, reader, None, exc)
             return _Attempt(question, reader, result, None, submit.answer)
 
@@ -357,14 +372,20 @@ class DiscoveryCoordinator:
             # this point (recording happens after the gather, and `run_one` writes nothing), so
             # every question of this run becomes a failed row before the cancellation propagates.
             for _, question, _, _ in prepared:
-                self._record_failure(
-                    principal,
-                    engagement_id,
-                    question,
-                    _Cancelled("the discovery run was cancelled while this subagent was running"),
-                    0,
-                    0,
-                )
+                # Each in its own try: a raise in the first would otherwise skip the rest AND
+                # replace the `CancelledError` with itself, so one failed write would cost both
+                # the remaining rows and the cancellation.
+                with contextlib.suppress(Exception):
+                    self._record_failure(
+                        principal,
+                        engagement_id,
+                        question,
+                        _Cancelled(
+                            "the discovery run was cancelled while this subagent was running"
+                        ),
+                        0,
+                        0,
+                    )
             raise
 
         outcomes: list[SubagentOutcome] = []
@@ -376,7 +397,29 @@ class DiscoveryCoordinator:
                     self._record_failure(principal, engagement_id, question, attempt, 0, 0)
                 )
                 continue
-            outcomes.append(self._record(principal, engagement_id, attempt, library))
+            # **Recording is isolated per question.** `record_claims` can refuse a whole batch --
+            # a finding whose text the store rejects, a document that became unreadable -- and
+            # that refusal used to escape this loop, aborting a run whose questions were already
+            # persisted and leaving every one of them with no `subagent_run` row: the same
+            # half-written state the cancelled-gather handler above exists to prevent, by a
+            # different route. A question whose recording fails becomes a failed row, and its
+            # siblings -- including ones that already answered -- keep theirs.
+            try:
+                outcomes.append(self._record(principal, engagement_id, attempt, library))
+            except Exception as exc:
+                outcomes.append(
+                    self._record_failure(
+                        principal,
+                        engagement_id,
+                        question,
+                        exc,
+                        0,
+                        0,
+                        unread=dict(attempt.reader.unread_reasons)
+                        if attempt.reader is not None
+                        else {},
+                    )
+                )
         return tuple(outcomes)
 
     # -- recording -----------------------------------------------------------------------------
