@@ -1,0 +1,2 @@
+# The discovery pack is compared byte for byte. Keep the checkout on LF.
+sources/acme-p2p/** text eol=lf

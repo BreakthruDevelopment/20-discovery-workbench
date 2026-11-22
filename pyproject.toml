@@ -45,7 +45,9 @@ select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF", "S", "ASYNC"]
 [tool.mypy]
 strict = true
 python_version = "3.12"
-files = ["workbench", "tests"]
+# The pack generator lives under sources/acme-p2p/ and is not an importable package
+# (the directory name is hyphenated). It is still held to this strict check.
+files = ["workbench", "tests", "sources/acme-p2p/generate.py"]
 warn_unreachable = true
 
 [tool.pytest.ini_options]
