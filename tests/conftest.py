@@ -116,3 +116,9 @@ def sponsor(fixture: Fixture) -> Principal:
 def other_analyst(fixture: Fixture) -> Principal:
     """Assigned to the OTHER engagement. The owner filter's counter-example."""
     return fixture.store.load_principal("analyst-shaw", Role.ANALYST)
+
+
+# The coordinator's fixtures live in `conftest_pack.py` and are re-exported here so pytest
+# collects them for every test module: a `conftest_pack.py` beside this file is an ordinary module,
+# not a plugin, so its fixtures would otherwise be invisible.
+pytest_plugins = ["tests.conftest_pack"]
