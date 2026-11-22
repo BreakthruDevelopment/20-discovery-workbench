@@ -43,6 +43,13 @@ jobs:
       - run: uv run --frozen mypy --strict
       - run: uv run --frozen pytest
       - name: Build the package
+        # `python -P`, not a bare `python -c`: this step runs with the checkout root as cwd, and
+        # without -P the script directory (here, "") goes on sys.path FIRST, so `import workbench`
+        # resolves to ./workbench -- the source tree -- and the step cannot fail however broken the
+        # wheel is. Measured on this branch: a bare -c imported
+        # /var/tmp/.../20-discovery-workbench/workbench/__init__.py, and -P imported
+        # /tmp/wheel-check/lib/python3.12/site-packages/workbench/__init__.py. Only the second is
+        # a proof that the wheel installs and imports, which is what this step claims to be.
         run: |
           uv build
           uv venv --python 3.12 /tmp/wheel-check
@@ -50,8 +57,17 @@ jobs:
           uv export --quiet --frozen --no-dev --no-emit-project --no-hashes -o /tmp/runtime-reqs.txt
           uv pip install --python /tmp/wheel-check/bin/python -r /tmp/runtime-reqs.txt
           uv pip install --python /tmp/wheel-check/bin/python --no-deps dist/*.whl
-          /tmp/wheel-check/bin/python -c "import workbench, workbench.core, agent_container"
+          /tmp/wheel-check/bin/python -P -c "import workbench, workbench.core, agent_container"
+          # The package data the store needs must be IN the wheel, not merely next to it in the
+          # checkout -- a .sql file left out of the build is a container that starts and then fails
+          # on its first query.
+          /tmp/wheel-check/bin/python -P -c "from workbench.core import store; \
+            assert store._SCHEMA_PATH.is_file() and store._SEED_PATH.is_file()"
       - name: Smoke test (installed CLI)
+        # PYTHONSAFEPATH is the console script's `-P`: the `wb` entry point is a script in the
+        # venv, so without it cwd-adjacent imports win here too.
+        env:
+          PYTHONSAFEPATH: "1"
         run: |
           /tmp/wheel-check/bin/wb --version | tee smoke.out
           grep -q "^wb 0.1.0$" smoke.out
