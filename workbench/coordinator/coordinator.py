@@ -451,17 +451,7 @@ class DiscoveryCoordinator:
         library: SourceLibrary,
     ) -> SubagentOutcome:
         question = attempt.question
-        unread = dict(attempt.reader.unread_reasons) if attempt.reader is not None else {}
-        if attempt.reader is not None:
-            # A document the subagent simply never opened. Taken from the reader's own record of
-            # what it served, not from the subagent's `unread` list: a specialist that reads one
-            # of its two documents, answers from it, and says nothing about the other would
-            # otherwise look like one that read both. The question named it, so not reading it is
-            # coverage the readout should see.
-            served = set(attempt.reader.documents_served)
-            for doc_id in question.doc_ids:
-                if doc_id not in served and doc_id not in unread:
-                    unread[doc_id] = "this document was never read by the subagent"
+        unread = _unread_for(question, attempt.reader)
         if attempt.error is not None or attempt.result is None:
             error = attempt.error or InvalidInput("the subagent produced no result")
             return self._record_failure(
@@ -579,6 +569,28 @@ class _Attempt:
     answer: Answer | None = None
 
 
+def _unread_for(question: Question, reader: ReadDocumentTool | None) -> dict[str, str]:
+    """What this subagent did not read, from the coordinator's record of what it served.
+
+    `reader.unread_reasons` holds the documents the subagent **asked for** and got less than all
+    of -- a trim, a cap, an unreadable file. It says nothing about one it never opened, and that
+    was the larger gap: a question naming two documents whose subagent read one, answered from it
+    and said nothing about the other looked exactly like a question answered from both.
+
+    Derived from `documents_served`, not from `Answer.unread`: a subagent's list of what it could
+    not read is its own account, and could omit a document or name one it was never given, while
+    the reader's record cannot say anything that did not happen. Same rule as `claim.verified`.
+    """
+    if reader is None:
+        return {}
+    unread = dict(reader.unread_reasons)
+    served = set(reader.documents_served)
+    for doc_id in question.doc_ids:
+        if doc_id not in served and doc_id not in unread:
+            unread[doc_id] = "this document was never read by the subagent"
+    return unread
+
+
 def _specialist_message(question: Question) -> str:
     """Everything a subagent is told: its question, its specialism, its document ids.
 
@@ -592,9 +604,11 @@ def _specialist_message(question: Question) -> str:
     that no model could cause and no reader would expect.
 
     So the list is trimmed to fit, and the trim is stated in the message: the subagent is told it
-    was handed fewer ids than its question names. The documents left out are unreachable for it
-    (`read_document` only answers for an id it was given) and `_record` reports them as unread,
-    which is the honest version of a gap it would otherwise hit as a failure.
+    was handed fewer ids than its question names. Its `ReadDocumentTool` still holds every path
+    the question named -- an id it was not told about is one it would have to guess, 256 characters
+    long, and a document of its own question if it somehow did -- so the honest statement is not
+    that they are unreachable but that they are not offered: unlisted, and reported as unread by
+    `_record` unless the subagent produces the id from nowhere.
     """
     head = (
         f"QUESTION ({question.specialist}):\n{question.text}\n\n"

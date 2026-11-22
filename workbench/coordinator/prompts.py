@@ -56,7 +56,8 @@ When you have read what you need, call `submit_answer` exactly once with:
   `uncertainty`.
 - `insufficient_evidence`: true if your documents do not answer the question. Say so rather than
   filling the gap; a named gap is worth more here than a confident guess.
-- `unread`: the id of any document you could not read in full, using the reason the tool gave you.
+- `unread`: the id of any document you could not read in full. Ids only -- there is nowhere
+  in the schema to put a reason, and the coordinator records the reason the tool gave, not yours.
 
 Every quote is checked against its document, character for character, in code. A claim whose quote
 is not found verbatim is discarded and will not reach the readout, so do not tidy, re-wrap,

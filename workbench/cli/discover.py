@@ -106,9 +106,17 @@ def _one_line(value: str, *, limit: int = 600) -> str:
     applied at the other end -- constrain the id where it enters, flatten the prose where it
     leaves. Every line-breaking character goes, not just `\n`: `\r` alone moves a terminal's
     cursor to the start of the line and overwrites what is already there.
+
+    And every other non-printable with it, which splitting on whitespace does not reach: `\x1b`
+    is not whitespace, so `"\x1b[2J\x1b[H"` survived the flatten -- and `strategy:` is the last
+    line printed, so an escape sequence there can clear the screen or redraw over the coverage
+    block it was printed below. `DOC_ID_PATTERN` already refuses exactly these characters in an
+    id; this is the same rule at the other end, which is where it should have been from the
+    start: the two halves of one guard cannot disagree about what is dangerous.
     """
     flattened = " ".join(value.split())
-    return flattened if len(flattened) <= limit else flattened[:limit] + "…"
+    visible = "".join(char for char in flattened if char.isprintable())
+    return visible if len(visible) <= limit else visible[:limit] + "…"
 
 
 def _report(result: DiscoveryRun) -> None:

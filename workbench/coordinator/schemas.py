@@ -149,6 +149,10 @@ class Answer(_Strict):
     #: The subagent's own statement that its documents did not answer the question. Recorded and
     #: carried into coverage: "I could not tell" is an answer this app wants to keep.
     insufficient_evidence: bool = False
-    #: Documents it could not read in full, with the reason -- which comes from the source
-    #: library's stated `unread_reason`, not from the model's imagination.
+    #: The subagent's own account of what it could not read in full. Kept because an answer that
+    #: says so is more useful than one that does not -- but **not** what the record rests on: the
+    #: coordinator derives the unread set from what its `ReadDocumentTool` actually served, so a
+    #: list that omits a document, or names one the subagent was never given, changes nothing.
+    #: Same rule as `claim.verified`, one level up: a subagent's self-report is evidence of what
+    #: it believes, never of what happened.
     unread: list[DocId] = Field(default_factory=list, max_length=32)

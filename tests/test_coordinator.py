@@ -1003,3 +1003,90 @@ def test_a_question_naming_many_long_ids_still_fits_app_17_s_message_cap() -> No
     assert len(message) <= MAX_USER_MESSAGE_CHARS
     assert "NOT LISTED" in message
     assert doc_ids[0] in message
+
+
+def test_a_document_the_subagent_never_opened_is_reported_unread(
+    pack: Pack, pack_analyst: Principal
+) -> None:
+    """A document nobody opened is exactly what a coverage line is for.
+
+    `unread_reasons` holds only documents the subagent asked for and got less than all of, so a
+    question naming two documents whose subagent reads one, answers from it and says nothing about
+    the other looked like a question answered from both. The rule that fixed it was added with no
+    test: replacing its loop with `for doc_id in ():` left the suite green.
+    """
+    source = recording_source(
+        plan_payload={
+            "questions": [
+                {
+                    "text": "how is matching done?",
+                    "specialist": "process",
+                    "doc_ids": [CLERK, POLICY],
+                    "rationale": "two documents, one of which the subagent ignores",
+                }
+            ],
+            "strategy_note": "a note",
+        },
+        specialists={
+            "1": answering_specialist(
+                [CLERK],
+                answer([finding(claim="manual matching", doc_id=CLERK, quote=MATCHING)]),
+            )
+        },
+    )
+    result = asyncio.run(pack.coordinator(source).discover(pack_analyst, ACME, budget=_budget()))
+    (outcome,) = result.outcomes
+    assert outcome.state == "ok"
+    assert POLICY in outcome.unread
+    assert "never read" in outcome.unread[POLICY]
+    # And the document it did read carries its own reason -- a trim, from the reader -- rather
+    # than being swept into the never-read rule.
+    assert "never read" not in outcome.unread.get(CLERK, "")
+
+
+def test_a_screened_out_plan_is_not_replanned(pack: Pack, pack_analyst: Principal) -> None:
+    """The planner is asked **once** when every question is dropped by the document screen.
+
+    Counted, not inferred from the recording's length: `ReplaySource.plan_provider()` builds a
+    fresh `ReplayProvider` over the same reply list on every call, so `plan_replies=2` constrains
+    nothing and a replan would simply replay the same reply. Pinning this by reply count -- which
+    is what the earlier version of this test's docstring claimed to do -- pinned nothing, and a
+    replan added on this path stayed green.
+    """
+    plan = _plan(_question("doc-northwind-ar--ar-notes-md-deadbeef")).model_dump(mode="json")
+    base = recording_source(plan_payload=plan, plan_replies=2)
+    handouts = 0
+
+    class _Counting:
+        def plan_provider(self) -> ModelProvider:
+            nonlocal handouts
+            handouts += 1
+            return base.plan_provider()
+
+        def specialist_provider(self, position: int) -> ModelProvider:
+            return base.specialist_provider(position)
+
+    with pytest.raises(PlanRefused):
+        asyncio.run(pack.coordinator(_Counting()).discover(pack_analyst, ACME, budget=_budget()))
+    assert handouts == 1
+
+
+def test_a_planner_that_submits_nothing_is_asked_exactly_twice(
+    pack: Pack, pack_analyst: Principal
+) -> None:
+    """The other side of the same rule: a plan the schema never got IS replanned, once."""
+    base = recording_source(plan_payload=None, plan_replies=2)
+    handouts = 0
+
+    class _Counting:
+        def plan_provider(self) -> ModelProvider:
+            nonlocal handouts
+            handouts += 1
+            return base.plan_provider()
+
+        def specialist_provider(self, position: int) -> ModelProvider:
+            return base.specialist_provider(position)
+
+    with pytest.raises(PlanRefused):
+        asyncio.run(pack.coordinator(_Counting()).discover(pack_analyst, ACME, budget=_budget()))
+    assert handouts == 2

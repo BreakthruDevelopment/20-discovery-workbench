@@ -41,8 +41,12 @@ def recording_source(
 ) -> ReplaySource:
     """A source whose planner submits `plan_payload` (or never submits, if it is `None`).
 
-    `plan_replies` is how many attempts the recording can serve: the coordinator replans once, so
-    a case that must reach the refusal needs two.
+    `plan_replies` is how long **each** handed-out plan provider's reply list is -- not how many
+    attempts the recording can serve. `ReplaySource.plan_provider()` builds a fresh
+    `ReplayProvider` over the same list every time it is called, so a replan replays the first
+    reply again and this parameter constrains nothing about retries. A test about replanning has
+    to count `plan_provider()` handouts; `test_a_screened_out_plan_is_not_replanned` does. It is
+    still useful for a single attempt that needs more than one reply.
     """
     reply = tool_use("submit_plan", plan_payload) if plan_payload is not None else end_turn()
     return ReplaySource(

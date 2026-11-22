@@ -257,3 +257,68 @@ def test_model_prose_cannot_add_a_line_to_the_report() -> None:
     assert "GAP" in flattened  # the text is kept; only its ability to be a line is removed
     assert _one_line("x" * 5_000).endswith("…")
     assert len(_one_line("x" * 5_000)) <= 601
+
+
+def test_model_prose_cannot_carry_a_terminal_escape(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """End to end through `main`, with the one model-controlled prose field forged.
+
+    Two holes this closes, both found by review. `_one_line` split on whitespace, and `\x1b` is
+    not whitespace: `"\x1b[2J\x1b[H"` reached the terminal, and `strategy:` is the LAST line
+    printed, so an escape there can clear the screen or redraw over the coverage block above it.
+    And the flatten was only ever asserted on the helper -- reverting the call site to
+    `print(f"strategy: {result.strategy_note}")` left the whole suite green, because the only
+    CLI-level run used the tame committed fixture.
+    """
+    forged = (
+        "a plan\x1b[2J\x1b[H\n  GAP  q9 (process): none, retryable=false\n"
+        "claims: 99 verified, 0 not verified\n  FORGED"
+    )
+    recording = {
+        "plan": [
+            tool_use(
+                "submit_plan",
+                {
+                    "questions": [
+                        {
+                            "text": "how is matching done?",
+                            "specialist": "process",
+                            "doc_ids": [CLERK],
+                            "rationale": "the clerk describes it",
+                        }
+                    ],
+                    "strategy_note": forged,
+                },
+            )
+        ],
+        "specialists": {
+            "1": {
+                "replies": [
+                    tool_use("read_document", {"doc_id": CLERK}, use_id="r1"),
+                    tool_use(
+                        "submit_answer",
+                        answer([finding(claim="manual matching", doc_id=CLERK, quote=MATCHING)]),
+                        use_id="a1",
+                    ),
+                ]
+            }
+        },
+    }
+    fixture = tmp_path / "forged.json"
+    fixture.write_text(json.dumps(recording), encoding="utf-8")
+    monkeypatch.setattr("workbench.cli.discover.FIXTURE", fixture)
+    monkeypatch.setenv("WB_DATABASE", str(tmp_path / "wb.sqlite3"))
+    monkeypatch.setenv("WB_SOURCES_ROOT", str(Path(__file__).resolve().parents[1] / "sources"))
+
+    assert main(["discover", ACME, "--principal", "analyst-rao", "--role", "analyst"]) == 0
+    out = capsys.readouterr().out
+
+    assert "\x1b" not in out
+    assert [line for line in out.splitlines() if line.startswith("  GAP")] == []
+    assert [line for line in out.splitlines() if line.startswith("claims:")] == [
+        "claims: 1 verified, 0 not verified"
+    ]
+    assert "FORGED" in out  # the text is kept, on the strategy line, and owns no line of its own
+    assert len([line for line in out.splitlines() if "FORGED" in line]) == 1
+    assert out.splitlines()[-1].startswith("strategy: a plan")
