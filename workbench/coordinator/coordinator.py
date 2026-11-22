@@ -326,7 +326,17 @@ class DiscoveryCoordinator:
             # up to its own cap, the tool bounds delivery to `answer_input_cap`, and six subagents
             # are bounded by 6 x `answer_input_cap` rather than by one shared allowance they race
             # for. Fixing the charge inside `SourceLibrary.read` would need a `limit` parameter in
-            # `workbench/core/`, which this slice may not edit.
+            # `workbench/core/`, which this slice may not edit (issue #12).
+            #
+            # Said plainly, because it re-scopes a wave-1 control from a wave-3 slice: this makes
+            # `MAX_SOURCE_RUN_BYTES` (400,000) a **per-subagent** cap, so the bytes one run may
+            # read off disk go from 400,000 to up to 6 x 400,000. The bound that governs cost --
+            # what reaches a model -- is unchanged and tighter, `answer_input_cap` per subagent,
+            # 6 x 20,000 characters for the largest plan the schema allows. Dividing the run cap
+            # by the number of subagents instead would hold the disk figure and reintroduce the
+            # same starvation inside one question, whose three large documents would lose the
+            # third. So: more local reading of a committed, synthetic, read-only tree, in
+            # exchange for every question being answered from all of its evidence.
             reader = ReadDocumentTool(
                 SourceLibrary.for_engagement(self._config, engagement_id),
                 paths,
