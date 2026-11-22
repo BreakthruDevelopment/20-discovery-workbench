@@ -1,0 +1,19 @@
+name: Review gate
+# A reusable workflow runs on its CALLER's triggers, so all three are needed here. `issue_comment` matters most:
+# Codex records a clean pass by editing its state comment, which fires neither of the other two, and without it the
+# gate sits red on a result that is already false. `actions: write` is required too: a called workflow cannot hold
+# more token permissions than its caller grants, so without it the run fails at startup.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled, ready_for_review]
+  pull_request_review:
+    types: [submitted, edited, dismissed]
+  issue_comment:
+    types: [created, edited]
+permissions:
+  contents: read
+  pull-requests: read
+  actions: write # lets the gate re-run the pull_request run after a review
+jobs:
+  review:
+    uses: BreakthruDevelopment/ai-dev-os/.github/workflows/review-gate.yml@main
