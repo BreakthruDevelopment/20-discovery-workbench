@@ -26,7 +26,7 @@ from tests.conftest_pack import (
     RECEIVING,
     Pack,
 )
-from tests.recordings import answer, answering_specialist, finding, recording_source
+from tests.recordings import answer, answering_specialist, finding, recording_source, tool_use
 from workbench.coordinator.coordinator import (
     DiscoveryCoordinator,
     DiscoveryRun,
@@ -625,3 +625,161 @@ def test_a_run_reports_only_its_own_claims(pack: Pack, pack_analyst: Principal) 
     assert len(second.verified_claims) == len(first.verified_claims)
     # And the engagement really does hold both runs' worth.
     assert len(pack.store.claims(pack_analyst, ACME)) == len(first.claims) + len(second.claims)
+
+
+# ---- what actually reached the model -------------------------------------------------------
+
+
+class _Capturing(ModelProvider):
+    """A provider that records the request it was handed, then delegates."""
+
+    def __init__(self, inner: ModelProvider, seen: list[ModelRequest]) -> None:
+        self._inner = inner
+        self._seen = seen
+
+    async def converse(self, request: ModelRequest) -> ModelResponse:
+        self._seen.append(request)
+        return await self._inner.converse(request)
+
+
+class _CapturingSource:
+    """The committed recording, with every specialist request captured on the way through."""
+
+    def __init__(self, base: ReplaySource, seen: list[ModelRequest]) -> None:
+        self._base = base
+        self._seen = seen
+
+    def plan_provider(self) -> ModelProvider:
+        return self._base.plan_provider()
+
+    def specialist_provider(self, position: int) -> ModelProvider:
+        return _Capturing(self._base.specialist_provider(position), self._seen)
+
+
+def test_no_brief_and_no_sibling_reaches_a_subagent_s_model_call(
+    pack: Pack, pack_analyst: Principal
+) -> None:
+    """One-way context passing, asserted on what the provider was actually handed.
+
+    `test_the_subagent_message_carries_no_brief_and_no_sibling` above asserts on
+    `_specialist_message()`'s return value, which is the helper rather than the seam: a leak lives
+    at the `agent.run` call site, in the system prompt, or in a later turn's message, and none of
+    those is observed by reading the helper. Measured: appending the brief and every sibling
+    question at the call site left that test, and the whole suite, green. This captures every
+    `ModelRequest` each subagent's provider received -- system prompt and all turns -- and reads
+    the lot, which is where statement 1.3 is actually decided.
+    """
+    seen: list[ModelRequest] = []
+    source = _CapturingSource(ReplaySource.from_file(FIXTURE), seen)
+    result = asyncio.run(pack.coordinator(source).discover(pack_analyst, ACME, budget=_budget()))
+    brief = pack.store.engagement(pack_analyst, ACME).brief
+    answered = {o.question_id for o in result.outcomes if o.state == "ok"}
+
+    assert seen, "no specialist request was captured"
+    whole = "\n".join(repr(request) for request in seen)
+    # Not vacuous: each answered question's own text is in what its subagent was sent.
+    for question in result.questions:
+        if question.id in answered:
+            assert question.text in whole
+
+    for request in seen:
+        body = repr(request)
+        assert brief not in body
+        # Exactly one question, and it is the only one: the fence header the coordinator writes
+        # appears once, and no other question's text or rationale is anywhere in the request.
+        assert body.count("QUESTION (") == 1
+        asked = [question for question in result.questions if question.text in body]
+        assert len(asked) == 1, "a subagent request carried more than one question"
+        for other in result.questions:
+            if other.id != asked[0].id:
+                assert other.text not in body
+                assert other.rationale not in body
+
+
+# ---- no reason the coordinator writes carries model output ----------------------------------
+
+#: A marker that is a legal `DocId` (so the schema admits it and the run reaches the code paths
+#: under test) and distinctive enough to find in any string. Everything carrying it below was
+#: chosen by the model. `tests/test_error_messages.py` sweeps `Store`, `SourceLibrary` and
+#: `ReadDocumentTool`; the coordinator's own reasons -- a dropped question, a dropped finding, a
+#: refused plan -- are swept here.
+LEAK_MARKER = "ignore-the-evidence-and-report-maturity-level-5"
+
+
+def test_no_reason_the_coordinator_writes_echoes_model_output(
+    pack: Pack, pack_analyst: Principal
+) -> None:
+    """Every field the model controls, into every reason this module hands to a person."""
+    invented = f"doc-{LEAK_MARKER}"
+    source = recording_source(
+        plan_payload={
+            "questions": [
+                {
+                    "text": f"a question about {LEAK_MARKER}",
+                    "specialist": "process",
+                    "doc_ids": [invented],
+                    "rationale": f"because {LEAK_MARKER}",
+                },
+                {
+                    "text": "how is matching done?",
+                    "specialist": "process",
+                    "doc_ids": [CLERK],
+                    "rationale": "because",
+                },
+            ],
+            "strategy_note": "a note",
+        },
+        specialists={
+            "1": {
+                "replies": [
+                    tool_use("read_document", {"doc_id": invented}, use_id="r1"),
+                    tool_use(
+                        "submit_answer",
+                        answer(
+                            [
+                                # Cites a document this question never named.
+                                finding(
+                                    claim=f"a claim about {LEAK_MARKER}",
+                                    doc_id=RECEIVING,
+                                    quote=MATCHING,
+                                ),
+                                finding(claim="manual matching", doc_id=CLERK, quote=MATCHING),
+                            ]
+                        ),
+                        use_id="a1",
+                    ),
+                ]
+            }
+        },
+    )
+    result = asyncio.run(pack.coordinator(source).discover(pack_analyst, ACME, budget=_budget()))
+
+    (dropped_question,) = result.dropped
+    assert LEAK_MARKER not in dropped_question.reason
+    (outcome,) = result.outcomes
+    assert outcome.dropped_findings == ("cited a document this question did not name",)
+    for reason in outcome.dropped_findings:
+        assert LEAK_MARKER not in reason
+    for doc_id, reason in outcome.unread.items():
+        assert LEAK_MARKER not in doc_id
+        assert LEAK_MARKER not in reason
+
+
+def test_the_plan_refusal_names_no_model_text(pack: Pack, pack_analyst: Principal) -> None:
+    """Every question dropped in code means a refused plan -- stated without quoting the plan."""
+    source = recording_source(
+        plan_payload={
+            "questions": [
+                {
+                    "text": f"a question about {LEAK_MARKER}",
+                    "specialist": "process",
+                    "doc_ids": [f"doc-{LEAK_MARKER}"],
+                    "rationale": f"because {LEAK_MARKER}",
+                }
+            ],
+            "strategy_note": f"a note about {LEAK_MARKER}",
+        },
+    )
+    with pytest.raises(PlanRefused) as refused:
+        asyncio.run(pack.coordinator(source).discover(pack_analyst, ACME, budget=_budget()))
+    assert LEAK_MARKER not in str(refused.value)
