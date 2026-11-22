@@ -243,3 +243,17 @@ def test_the_coverage_block_contains_only_lines_the_cli_writes(
     gaps = [line for line in out.splitlines() if "GAP" in line]
     assert len(gaps) == 1
     assert "FORGED" not in out
+
+
+def test_model_prose_cannot_add_a_line_to_the_report() -> None:
+    """`strategy_note` is the planner's own prose and was printed verbatim, so a note containing a
+    newline could add a line indistinguishable from one the CLI wrote."""
+    from workbench.cli.discover import _one_line
+
+    forged = "a plan\n  GAP  q9 (process): none, retryable=false\n  FORGED"
+    flattened = _one_line(forged)
+    assert "\n" not in flattened
+    assert "\r" not in flattened
+    assert "GAP" in flattened  # the text is kept; only its ability to be a line is removed
+    assert _one_line("x" * 5_000).endswith("…")
+    assert len(_one_line("x" * 5_000)) <= 601

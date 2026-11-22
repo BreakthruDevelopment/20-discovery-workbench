@@ -33,13 +33,26 @@ MAX_CLAIM_CHARS = 2_000
 MAX_QUOTE_CHARS = 2_000
 MAX_NOTE_CHARS = 2_000
 
-#: What a document id may contain. Derived ids are `doc-<engagement>--<slug>-<digest>`, so this is
-#: generous -- and it is here because a `doc_id` is **model-chosen text** that reaches an operator's
-#: terminal. Unconstrained, a subagent could name a document
-#: `"x\n  GAP  q9 (process): none, retryable=false"` and forge a line inside `wb discover`'s
-#: coverage block, which is the product. A pattern with no newline in it is the fix; keeping the id
-#: out of the record where it is not ours is the other half (see `tools.py`).
-DOC_ID_PATTERN = r"\A[A-Za-z0-9._-]{1,256}\z"
+#: What a document id may contain, as a **deny-list**: anything but a control character, DEL, a
+#: C1 character, or a Unicode line or paragraph separator.
+#:
+#: Why a pattern at all: a `doc_id` is model-chosen text that reaches an operator's terminal
+#: through `wb discover`'s coverage block, and an id carrying a newline forged a `GAP` line there.
+#: So the thing that must be impossible is a **line break**, not an unusual character.
+#:
+#: Why not an allow-list: the first version of this was `[A-Za-z0-9._-]`, and it rejected ids this
+#: repo's own `document_id()` produces. That function replaces only `/` and `.`, so every other
+#: character of a filename survives into the id, and nothing constrains a filename beyond its
+#: extension. `AP policy.md`, `memos/résumé.md`, `Q3 spend (draft).csv` and `interview—clerk.md`
+#: all yield ids the allow-list refused -- and the failure was ugly: the document indexes fine,
+#: appears in the index the planner is shown, the planner copies the id back correctly, and the
+#: plan is then rejected, replanned once and refused, blaming the model for reading the index
+#: right. The committed pack has only tame filenames, which is exactly why no test caught it.
+#:
+#: `\A` and `\z`, not `^` and `$`: pydantic-core compiles this with Rust's `regex`, where `$`
+#: would also match before a trailing newline. (That engine is also why `\u{...}` is spelled
+#: this way, and why Python's own `re` cannot compile this string -- a test pins both facts.)
+DOC_ID_PATTERN = r"\A[^\x00-\x1f\x7f-\x9f\u{2028}\u{2029}]{1,256}\z"
 
 #: A document id as a field type. `Annotated` on the ITEM, because `pattern=` on a `list[str]`
 #: field is applied to the list and raises `TypeError` out of `model_validate` -- which escapes
@@ -115,6 +128,18 @@ class Finding(_Strict):
     @classmethod
     def _not_blank(cls, value: str) -> str:
         return _clean_text(value, "a finding's text")
+
+    @field_validator("uncertainty")
+    @classmethod
+    def _no_nul(cls, value: str) -> str:
+        """`uncertainty` may be empty -- it is optional -- but it may not carry a NUL.
+
+        Nothing persists or prints it today. It is the one `Finding` string outside `_clean_text`,
+        and a slice that starts storing it should not have to discover that.
+        """
+        if "\x00" in value:
+            raise ValueError("uncertainty contains a NUL byte")
+        return value.strip()
 
 
 class Answer(_Strict):

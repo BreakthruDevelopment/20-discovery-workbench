@@ -97,6 +97,20 @@ def _source(
     )
 
 
+def _one_line(value: str, *, limit: int = 600) -> str:
+    """Model text, flattened to one line and capped, before it is printed.
+
+    `strategy_note` is the planner's own prose and it was printed verbatim: a note containing a
+    newline could add a line to this output, and a line that looks like `  GAP  q9 (process): …`
+    is indistinguishable from one this function wrote. The same reasoning as the `doc_id` pattern,
+    applied at the other end -- constrain the id where it enters, flatten the prose where it
+    leaves. Every line-breaking character goes, not just `\n`: `\r` alone moves a terminal's
+    cursor to the start of the line and overwrites what is already there.
+    """
+    flattened = " ".join(value.split())
+    return flattened if len(flattened) <= limit else flattened[:limit] + "…"
+
+
 def _report(result: DiscoveryRun) -> None:
     """Coverage first, then the findings. A gap is never further down the page than a claim."""
     failed = result.failed
@@ -127,4 +141,4 @@ def _report(result: DiscoveryRun) -> None:
         )
         for doc_id, reason in sorted(outcome.unread.items()):
             print(f"      unread {doc_id}: {reason}")
-    print(f"strategy: {result.strategy_note}")
+    print(f"strategy: {_one_line(result.strategy_note)}")

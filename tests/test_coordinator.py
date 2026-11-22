@@ -625,3 +625,139 @@ def test_a_run_reports_only_its_own_claims(pack: Pack, pack_analyst: Principal) 
     assert len(second.verified_claims) == len(first.verified_claims)
     # And the engagement really does hold both runs' worth.
     assert len(pack.store.claims(pack_analyst, ACME)) == len(first.claims) + len(second.claims)
+
+
+# ---- document ids the repo's own document_id() produces -------------------------------------
+
+
+@pytest.mark.parametrize(
+    "filename",
+    [
+        "AP policy.md",
+        "Q3 spend (draft).csv",
+        "interview—clerk.md",
+        "résumé.md",
+        "notes [final].md",
+        "a,b;c.md",
+        "100% coverage.md",
+    ],
+)
+def test_a_document_id_from_an_awkward_filename_is_plannable(tmp_path: Path, filename: str) -> None:
+    """An allow-list pattern on `doc_id` refused ids `document_id()` legitimately produces.
+
+    `document_id()` replaces only `/` and `.`, so every other character of a filename survives
+    into the id, and nothing constrains a filename beyond its extension. The failure was ugly: the
+    document indexed fine, appeared in the index the planner was shown, the planner copied the id
+    back correctly, and the plan was rejected, replanned once and refused -- blaming the model for
+    reading the index right. The committed pack has only tame filenames, which is why no test
+    caught it; this one parametrises the class.
+    """
+    from workbench.coordinator.schemas import Plan, PlannedQuestion, Specialist
+    from workbench.core.sources import document_id
+
+    doc_id = document_id(ACME, filename)
+    # It must survive the schema, which is what the planner's answer is validated against...
+    question = PlannedQuestion(
+        text="a question", specialist=Specialist.PROCESS, doc_ids=[doc_id], rationale="because"
+    )
+    assert question.doc_ids == [doc_id]
+    Plan(questions=[question], strategy_note="a note")
+    # ...and the read tool's own arguments.
+    from workbench.coordinator.tools import _ReadArgs
+
+    assert _ReadArgs(doc_id=doc_id).doc_id == doc_id
+
+
+def test_an_awkward_filename_plans_and_answers_end_to_end(tmp_path: Path) -> None:
+    """The regression as a user would meet it, not only at the schema."""
+    from datetime import UTC, datetime
+    from itertools import count
+
+    from workbench.core.config import Config
+    from workbench.core.principals import Role
+    from workbench.core.store import Store
+
+    root = tmp_path / "sources" / ACME
+    root.mkdir(parents=True)
+    quote = "Matching is done by hand on every invoice over ten thousand dollars."
+    (root / "AP policy.md").write_text(f"# AP policy\n\n{quote}\n", encoding="utf-8")
+
+    config = Config(database_path=tmp_path / "wb.sqlite3", sources_root=tmp_path / "sources")
+    ids = count(1)
+    with Store.open(
+        config,
+        now=lambda: datetime(2026, 11, 22, 6, 0, tzinfo=UTC),
+        new_id=lambda: f"id-{next(ids):04d}",
+    ) as store:
+        store.build()
+        analyst = store.load_principal("analyst-rao", Role.ANALYST)
+        (ref,) = store.index_sources(analyst, ACME, SourceLibrary.for_engagement(config, ACME))
+        assert " " in ref.doc_id, "the id must actually carry the awkward character"
+        source = recording_source(
+            plan_payload={
+                "questions": [
+                    {
+                        "text": "How is matching done?",
+                        "specialist": "process",
+                        "doc_ids": [ref.doc_id],
+                        "rationale": "the policy describes it",
+                    }
+                ],
+                "strategy_note": "one question",
+            },
+            specialists={
+                "1": answering_specialist(
+                    [ref.doc_id],
+                    answer([finding(claim="Manual.", doc_id=ref.doc_id, quote=quote)]),
+                )
+            },
+        )
+        result = asyncio.run(
+            DiscoveryCoordinator(store, config, source).discover(analyst, ACME, budget=_budget())
+        )
+
+    assert [o.state for o in result.outcomes] == ["ok"]
+    assert len(result.verified_claims) == 1
+
+
+def test_the_pattern_forbids_only_line_breaking_characters() -> None:
+    """A deny-list, and what it denies is what could forge a line of output."""
+    import re
+
+    import pydantic
+
+    from workbench.coordinator.schemas import DOC_ID_PATTERN, Finding
+
+    def ok(doc_id: str) -> bool:
+        try:
+            Finding.model_validate(
+                {"claim": "c", "doc_id": doc_id, "quote": "a quote long enough", "confidence": 0.5}
+            )
+        except pydantic.ValidationError:
+            return False
+        return True
+
+    for breaking in (
+        "a\nb",
+        "a\rb",
+        "a\r\nb",
+        "a\x00b",
+        "a\x85b",
+        f"a{chr(0x2028)}b",
+        f"a{chr(0x2029)}b",
+        "a\x1b[2Kb",
+        "a\x08b",
+        "a\x0bb",
+        "a\x0cb",
+        "a\x7fb",
+        "x" * 257,
+        "",
+    ):
+        assert not ok(breaking), f"{breaking!r} should be refused"
+    for benign in ("doc-a b-c", "doc-résumé", "doc-(x)", "doc—dash", "doc-100%", "x" * 256):
+        assert ok(benign), f"{benign!r} should be accepted"
+
+    # Pinned because it is surprising: pydantic-core compiles this with Rust's `regex`, so the
+    # pattern uses `\u{...}` and `\z` and Python's own `re` cannot compile it at all.
+    with pytest.raises(re.error):
+        re.compile(DOC_ID_PATTERN)

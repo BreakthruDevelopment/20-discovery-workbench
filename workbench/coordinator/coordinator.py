@@ -433,6 +433,16 @@ class DiscoveryCoordinator:
     ) -> SubagentOutcome:
         question = attempt.question
         unread = dict(attempt.reader.unread_reasons) if attempt.reader is not None else {}
+        if attempt.reader is not None:
+            # A document the subagent simply never opened. Taken from the reader's own record of
+            # what it served, not from the subagent's `unread` list: a specialist that reads one
+            # of its two documents, answers from it, and says nothing about the other would
+            # otherwise look like one that read both. The question named it, so not reading it is
+            # coverage the readout should see.
+            served = set(attempt.reader.documents_served)
+            for doc_id in question.doc_ids:
+                if doc_id not in served and doc_id not in unread:
+                    unread[doc_id] = "this document was never read by the subagent"
         if attempt.error is not None or attempt.result is None:
             error = attempt.error or InvalidInput("the subagent produced no result")
             return self._record_failure(
