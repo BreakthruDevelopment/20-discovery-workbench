@@ -264,10 +264,18 @@ def test_a_plan_with_no_surviving_question_is_a_stated_refusal(
     pack: Pack, pack_analyst: Principal
 ) -> None:
     """End to end, not by calling `_screen`: a recorded plan whose only question names another
-    engagement's document must reach `PlanRefused` rather than an empty run reported as a
-    success. The planner is retried once first, which is why the recording holds two replies."""
+    engagement's document must reach `PlanRefused` rather than an empty run reported as a success.
+
+    **And without a replan**, which is the spec's distinction and what the one recorded reply
+    here pins: a plan that does not satisfy the schema (more than six questions, a specialist
+    outside the closed set) is a *rejected plan*, replanned once; a question naming a document
+    outside the engagement is *dropped in code, not argued with*. Asking the planner again would
+    be arguing with it, and would spend the run's budget on a second plan built from the same
+    index. An earlier version of this docstring claimed the planner is retried first and handed
+    the recording two replies, only one of which was ever consumed -- so it read as though the
+    retry were being exercised when nothing asserted it either way."""
     plan = _plan(_question("doc-northwind-ar--ar-notes-md-deadbeef")).model_dump(mode="json")
-    source = recording_source(plan_payload=plan, plan_replies=2)
+    source = recording_source(plan_payload=plan)
     with pytest.raises(PlanRefused):
         asyncio.run(pack.coordinator(source).discover(pack_analyst, ACME, budget=_budget()))
     assert pack.store.questions(pack_analyst, ACME) == ()

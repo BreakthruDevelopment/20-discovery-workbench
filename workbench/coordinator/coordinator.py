@@ -185,11 +185,20 @@ class DiscoveryCoordinator:
         index: Sequence[SourceRef],
         budget: Budget,
     ) -> tuple[Plan, bool]:
-        """Run the plan task, once, then once more if the first produced nothing usable.
+        """Run the plan task, once, then once more if the first produced **nothing the schema
+        accepts**.
 
         Replanned **once**, then a stated failure: the spec's rule, and the reason it is a rule is
         that a model which cannot produce a six-question plan from an index will not produce one on
         the third attempt either, and each attempt spends the run's budget.
+
+        "Nothing usable" means nothing the schema accepts -- a plan that never arrived, more than
+        six questions, a specialist outside the closed set. It does **not** mean a plan every
+        question of which is screened out for naming another engagement's document: the spec
+        separates the two, and that one is "dropped in code, not argued with". Asking the planner
+        again would be arguing with it, from the same brief and the same index, at the cost of the
+        run's budget. `_screen` runs after this method precisely so the distinction stays visible;
+        `test_a_plan_with_no_surviving_question_is_a_stated_refusal` pins it.
         """
         message = self._plan_message(brief, index)
         plan = await self._attempt_plan(message, budget)
