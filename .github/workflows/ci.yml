@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# GitHub's default run shell is `bash -e {0}`, which takes a pipeline's status from its LAST command. With pipefail a
+# CLI that prints the expected line and then exits non-zero fails the smoke step instead of going green via `tee`.
+defaults:
+  run:
+    shell: bash -euo pipefail {0}
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    # The name is load-bearing: the branch ruleset requires exactly this string.
+    name: Lint, test, build, smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # No secrets: this slice's CI needs none, and no step reads any.
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      # `--locked`, not `--frozen`: `--frozen` installs from the lock WITHOUT checking it still
+      # matches pyproject.toml, so a dependency added and never relocked passes CI and is then
+      # simply absent at deploy, because the Dockerfile installs the locked set. Measured:
+      # adding httpx without relocking left `--frozen` at exit 0 and every step green.
+      - run: uv sync --locked
+      # `--frozen` on each `uv run` too: without it, `uv run` silently REWRITES uv.lock in the
+      # tree and resolves the addition from PyPI, so the job both hides the error and mutates
+      # the file it was meant to be validating.
+      - run: uv run --frozen ruff check .
+      - run: uv run --frozen ruff format --check .
+      - run: uv run --frozen mypy --strict
+      - run: uv run --frozen pytest
+      - name: Build the package
+        run: |
+          uv build
+          uv venv --python 3.12 /tmp/wheel-check
+          # A wheel carries no [tool.uv.sources], so the pinned app 17 tag comes from the lockfile.
+          uv export --quiet --frozen --no-dev --no-emit-project --no-hashes -o /tmp/runtime-reqs.txt
+          uv pip install --python /tmp/wheel-check/bin/python -r /tmp/runtime-reqs.txt
+          uv pip install --python /tmp/wheel-check/bin/python --no-deps dist/*.whl
+          /tmp/wheel-check/bin/python -c "import workbench, workbench.core, agent_container"
+      - name: Smoke test (installed CLI)
+        run: |
+          /tmp/wheel-check/bin/wb --version | tee smoke.out
+          grep -q "^wb 0.1.0$" smoke.out
+
+  image:
+    name: Container image
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-buildx-action@v3
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: runner
+          push: false
+          load: true
+          tags: wb:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Run the CLI in the image
+        run: docker run --rm wb:ci --version | grep -q "^wb 0.1.0$"
