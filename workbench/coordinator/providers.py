@@ -133,9 +133,13 @@ class LiveSource:
     def __init__(
         self, config: Config, principal: Principal, engagement_id: str, state: EngagementState
     ) -> None:
+        # The check first, the import second: an unauthorised `--live` must not so much as load
+        # boto3, let alone build a client. (`AccessDenied` from here is also what keeps the
+        # refusal in the one object that can reach the network, rather than in a caller.)
+        assert_can(principal, Action.RUN_LIVE, Resource(engagement_id, state))
+
         from agent_container.core.bedrock import BedrockProvider
 
-        assert_can(principal, Action.RUN_LIVE, Resource(engagement_id, state))
         model = config.live_model_reference()
         self._shared = RateLimitedProvider(
             BedrockProvider(model_id=model, region_name=config.region),

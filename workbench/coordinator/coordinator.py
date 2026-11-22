@@ -573,15 +573,41 @@ class _Attempt:
 def _specialist_message(question: Question) -> str:
     """Everything a subagent is told: its question, its specialism, its document ids.
 
-    Not the brief, not the other questions, not another subagent's answer. Short by construction,
-    so app 17's 8,000-character user-message cap is never in play -- the documents arrive through
-    the tool.
+    Not the brief, not the other questions, not another subagent's answer. The documents
+    themselves arrive through the tool, so this stays short -- but **not short by construction**,
+    which is what this docstring used to claim. A question may name 32 documents
+    (`PlannedQuestion.doc_ids`) each up to 256 characters, so the id list alone can pass app 17's
+    8,000-character `MAX_USER_MESSAGE_CHARS`: measured at 8,377. Over the cap, `AgentLoop.run`
+    raises before the first turn and the subagent becomes a failed row -- a coverage gap whose
+    only cause was a question naming a lot of evidence, and the one failure mode of this fan-out
+    that no model could cause and no reader would expect.
+
+    So the list is trimmed to fit, and the trim is stated in the message: the subagent is told it
+    was handed fewer ids than its question names. The documents left out are unreachable for it
+    (`read_document` only answers for an id it was given) and `_record` reports them as unread,
+    which is the honest version of a gap it would otherwise hit as a failure.
     """
-    ids = "\n".join(f"- {doc_id}" for doc_id in question.doc_ids)
-    return (
+    head = (
         f"QUESTION ({question.specialist}):\n{question.text}\n\n"
-        f"DOCUMENTS YOU MAY READ (use read_document with one of these ids):\n{ids}\n"
+        "DOCUMENTS YOU MAY READ (use read_document with one of these ids):\n"
     )
+    #: Room kept for the note the trim appends, so adding it cannot itself pass the cap.
+    note_room = 200
+    lines: list[str] = []
+    dropped = 0
+    for doc_id in question.doc_ids:
+        entry = f"- {doc_id}"
+        if len(head) + len("\n".join([*lines, entry])) + 1 > MAX_USER_MESSAGE_CHARS - note_room:
+            dropped += 1
+            continue
+        lines.append(entry)
+    body = head + "\n".join(lines) + "\n"
+    if dropped:
+        body += (
+            f"\n[NOT LISTED: {dropped} further document(s) this question names are not listed "
+            "here and cannot be read in this answer.]\n"
+        )
+    return body[:MAX_USER_MESSAGE_CHARS]
 
 
 def _screen_findings(answer: Answer, question: Question) -> tuple[list[Finding], tuple[str, ...]]:

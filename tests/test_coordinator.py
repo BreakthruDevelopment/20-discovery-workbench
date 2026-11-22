@@ -919,3 +919,79 @@ def test_the_plan_refusal_names_no_model_text(pack: Pack, pack_analyst: Principa
     with pytest.raises(PlanRefused) as refused:
         asyncio.run(pack.coordinator(source).discover(pack_analyst, ACME, budget=_budget()))
     assert LEAK_MARKER not in str(refused.value)
+
+
+# ---- two enforcement points that nothing was asserting on -----------------------------------
+
+
+def test_the_finding_schema_refuses_blank_and_nul_text() -> None:
+    """`_clean_text` is the boundary that keeps the store's refusal out of the recording loop.
+
+    `min_length=1` admits `"   "` and text carrying a NUL, both of which `record_claims` refuses;
+    refused there, the raise came out of the recording loop and orphaned every question of the
+    run. The isolation is tested above; this is the boundary that stops it arising, and nothing
+    asserted on it -- replacing `_clean_text`'s body with `return value` left the suite green.
+    """
+    from pydantic import ValidationError
+
+    from workbench.coordinator.schemas import Finding
+
+    good = {"claim": "a claim", "doc_id": CLERK, "quote": MATCHING, "confidence": 0.5}
+    assert Finding.model_validate(good).claim == "a claim"
+    assert Finding.model_validate({**good, "claim": "  a claim  "}).claim == "a claim"
+    for field in ("claim", "quote"):
+        for bad in ("   ", "\t\n ", "text with a \x00 in it"):
+            with pytest.raises(ValidationError):
+                Finding.model_validate({**good, field: bad})
+
+
+def test_live_source_refuses_a_principal_that_may_not_run_live(pack: Pack) -> None:
+    """`assert_can(RUN_LIVE)` is asserted at its enforcement point, not only in the table.
+
+    `test_run_live_is_lead_only` asserts the permission table through `may()`. The check itself
+    moved out of `wb discover` and into `LiveSource`, which is right -- that object is the one
+    thing in the repo that can reach Bedrock -- but it left the enforcement untested: deleting the
+    call from the constructor left the whole suite green. The refusal must also come before any
+    Bedrock client exists, so an unauthorised `--live` builds nothing at all.
+    """
+    from workbench.coordinator.providers import LiveSource
+    from workbench.core.errors import AccessDenied
+    from workbench.core.principals import EngagementState, Role
+
+    analyst = pack.principal("analyst-rao", Role.ANALYST)
+    sponsor = pack.principal("sponsor-acme", Role.SPONSOR)
+    engagement = pack.store.engagement(analyst, ACME)
+
+    for principal in (analyst, sponsor):
+        with pytest.raises(AccessDenied):
+            LiveSource(pack.config, principal, engagement.id, EngagementState(engagement.state))
+    # A state of the caller's own choosing does not widen it either.
+    with pytest.raises(AccessDenied):
+        LiveSource(pack.config, analyst, engagement.id, EngagementState.FINAL)
+
+
+def test_a_question_naming_many_long_ids_still_fits_app_17_s_message_cap() -> None:
+    """32 documents at 256 characters is a legal question and an 8,377-character id list.
+
+    Over `MAX_USER_MESSAGE_CHARS` app 17's loop raises before the first turn, so the subagent
+    becomes a failed row and its question a coverage gap -- for naming a lot of evidence, which is
+    not a fault. The list is trimmed to fit and the trim is stated in the message.
+    """
+    from workbench.coordinator.coordinator import _specialist_message
+    from workbench.core.store import Question
+
+    doc_ids = tuple(f"doc-{n:03d}-".ljust(256, "x") for n in range(32))
+    assert all(len(doc_id) == 256 for doc_id in doc_ids)
+    question = Question(
+        id="q1",
+        engagement_id=ACME,
+        seq=1,
+        text="a question",
+        specialist="process",
+        doc_ids=doc_ids,
+        rationale="because",
+    )
+    message = _specialist_message(question)
+    assert len(message) <= MAX_USER_MESSAGE_CHARS
+    assert "NOT LISTED" in message
+    assert doc_ids[0] in message
