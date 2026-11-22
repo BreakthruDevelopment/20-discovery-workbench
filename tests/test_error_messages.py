@@ -104,15 +104,83 @@ def _refusals(fixture: Fixture, analyst: Principal) -> list[tuple[str, Callable[
     ]
 
 
+#: Members of `Store` and `SourceLibrary` that take no caller-supplied value to leak, so there is
+#: nothing for the sweep to poison. Everything else must appear in `_COVERED` below.
+_NOTHING_TO_LEAK = {
+    "Store.open",
+    "Store.close",
+    "Store.create_schema",
+    "Store.seed",
+    "Store.build",
+    "Store.engagement_ids",
+    "Store.engagement_summary",
+    "Store.questions",
+    "Store.subagent_runs",
+    "Store.claims",
+    "Store.readout",
+    "Store.save_readout",
+    "Store.failed_run_question_ids",
+    "Store.finalise",
+    "Store.finalisation_accepted_gaps",
+    "Store.index_sources",
+    "SourceLibrary.list_documents",
+}
+
+#: Which member each sweep case exercises. The sweep is hand-written -- a generic fuzzer cannot
+#: know what a valid call looks like -- but `test_every_member_that_takes_input_is_swept` makes the
+#: COVERAGE automatic: a new public member is either listed here, or declared as having nothing to
+#: leak, or the suite fails. That is the part the first version of this file only claimed.
+_COVERED = {
+    "engagement out of scope": "Store.engagement",
+    "source index out of scope": "Store.source_documents",
+    "unknown document id": "Store.document_path",
+    "unknown claim id": "Store.claim",
+    "bad specialist": "Store.record_questions",
+    "document outside the engagement": "Store.record_questions",
+    "question outside the engagement": "Store.record_subagent_run",
+    "bad run state": "Store.record_subagent_run",
+    "claim document outside the engagement": "Store.record_claims",
+    "path outside the root": "SourceLibrary.read",
+    "absolute path": "SourceLibrary.read",
+    "refused extension": "SourceLibrary.read",
+    "refused manifest": "SourceLibrary.read",
+    "missing document": "SourceLibrary.read",
+    "padded path": "SourceLibrary.read",
+    "short quote": "SourceLibrary.verify_quote",
+    "overlong quote": "SourceLibrary.verify_quote",
+    "empty principal id": "Store.load_principal",
+}
+
+
 def test_no_refusal_echoes_its_input(fixture: Fixture, analyst: Principal) -> None:
-    checked = 0
-    for label, call in _refusals(fixture, analyst):
+    cases = _refusals(fixture, analyst)
+    for label, call in cases:
         with pytest.raises(WorkbenchError) as refusal:
             call()
         message = str(refusal.value)
         assert MARKER not in message, f"{label} leaked its input: {message}"
-        checked += 1
-    assert checked >= 18
+    assert {label for label, _ in cases} == set(_COVERED)
+
+
+def test_every_member_that_takes_input_is_swept() -> None:
+    """The guard that makes the sweep's coverage automatic."""
+    import inspect
+
+    from workbench.core.sources import SourceLibrary as Library
+    from workbench.core.store import Store
+
+    members = {
+        f"{owner.__name__}.{name}"
+        for owner in (Store, Library)
+        for name, member in inspect.getmembers(owner, callable)
+        if not name.startswith("_") and inspect.isfunction(member)
+    }
+    uncovered = members - set(_COVERED.values()) - _NOTHING_TO_LEAK
+    assert not uncovered, (
+        "these public members are not covered by the message sweep: "
+        f"{sorted(uncovered)}. Add a case to _refusals/_COVERED, or list it in "
+        "_NOTHING_TO_LEAK with the reason it has no caller value to echo."
+    )
 
 
 def test_an_access_refusal_names_no_engagement(analyst: Principal) -> None:
@@ -175,7 +243,7 @@ def test_a_timeout_is_transient_and_retryable() -> None:
 
 
 def test_a_workbench_error_answers_for_itself(tmp_path: Path) -> None:
-    library = SourceLibrary(tmp_path, max_file_bytes=10, max_run_bytes=10)
+    library = SourceLibrary(tmp_path, engagement_id=ACME, max_file_bytes=10, max_run_bytes=10)
     try:
         library.read("../escape.md")
     except WorkbenchError as exc:

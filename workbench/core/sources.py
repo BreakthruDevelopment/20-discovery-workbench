@@ -83,19 +83,38 @@ class SourceText:
     unread_reason: str | None = None
 
 
+def _servable_name(path: Path) -> bool:
+    """Whether a filename is one this library serves at all: the stem and extension rules."""
+    return path.stem.lower() not in REFUSED_STEMS and path.suffix.lower() in ALLOWED_SUFFIXES
+
+
 def _normalise_newlines(text: str) -> str:
     """CRLF and CR to LF. A line-ending difference is an encoding detail, not a text difference."""
     return text.replace("\r\n", "\n").replace("\r", "\n")
 
 
-def document_id(relative_path: str) -> str:
-    """The stable id for a document at `relative_path` within one engagement.
+#: How much of the path digest goes in a document id. 8 hex characters over a per-engagement
+#: namespace; the readable slug beside it is what makes a fixture reviewable.
+_DIGEST_CHARS = 8
 
-    Derived from the path rather than assigned, so the index is deterministic: re-indexing the same
-    tree produces the same ids, and a recorded fixture keeps naming the same documents.
+
+def document_id(engagement_id: str, relative_path: str) -> str:
+    """The stable id for a document at `relative_path` in `engagement_id`.
+
+    Derived rather than assigned, so the index is deterministic: re-indexing the same tree produces
+    the same ids and a recorded fixture keeps naming the same documents.
+
+    Two things it must not do, both learned the hard way. It must not be **shared between
+    engagements**: `source_document.id` is a database-wide primary key, and two engagements that
+    both hold a `systems-inventory.csv` -- which the seed's two engagements plausibly would --
+    would collide on the second one's index. And it must not be **lossy**: collapsing `/` and `.`
+    into `-` made `a/b.md` and `a--b.md` the same id. So the engagement is part of the id and a
+    digest of the exact relative path is appended, which restores injectivity; the readable slug is
+    kept only because a reviewer has to be able to recognise a fixture.
     """
     slug = relative_path.replace("/", "--").replace(".", "-")
-    return f"doc-{slug}"
+    digest = hashlib.sha256(relative_path.encode("utf-8")).hexdigest()[:_DIGEST_CHARS]
+    return f"doc-{engagement_id}--{slug}-{digest}"
 
 
 class SourceLibrary:
@@ -110,11 +129,15 @@ class SourceLibrary:
         self,
         root: Path,
         *,
+        engagement_id: str,
         max_file_bytes: int,
         max_run_bytes: int,
     ) -> None:
         if max_file_bytes <= 0 or max_run_bytes <= 0:
             raise InvalidInput("source byte caps must be positive")
+        if not engagement_id.strip():
+            raise InvalidInput("a source library is rooted at one named engagement")
+        self._engagement_id = engagement_id
         self._max_file_bytes = max_file_bytes
         self._max_run_bytes = max_run_bytes
         self._bytes_served = 0
@@ -125,6 +148,16 @@ class SourceLibrary:
     @property
     def root(self) -> Path:
         return self._root
+
+    @property
+    def engagement_id(self) -> str:
+        """Which engagement's evidence this library serves.
+
+        Carried so `store.index_sources` and `store.record_claims` can refuse a library rooted at
+        a different engagement than the one they were asked about: that is the last piece of the
+        owner filter that would otherwise live in a caller.
+        """
+        return self._engagement_id
 
     @property
     def bytes_served(self) -> int:
@@ -162,14 +195,18 @@ class SourceLibrary:
         for path in sorted(self._root.rglob("*")):
             if not path.is_file():
                 continue
-            if path.stem.lower() in REFUSED_STEMS:
-                continue
-            if path.suffix.lower() not in ALLOWED_SUFFIXES:
+            if not _servable_name(path):
                 continue
             resolved = path.resolve()
             if not resolved.is_relative_to(self._root):
                 # A symlink inside the tree pointing out of it. Left out of the index entirely:
                 # it is not this engagement's evidence, so it is not listed as unreadable either.
+                continue
+            # The resolved name is screened as well as the link's own. `notes.md -> manifest.json`
+            # passes the name check and lands on the answer key; `_resolve` would refuse it on a
+            # read, but it would already have been listed with the manifest's real size and
+            # digest, which is a leak from the one file that must never be served.
+            if not _servable_name(resolved):
                 continue
             yield path
 
@@ -193,7 +230,7 @@ class SourceLibrary:
                 reason = "not valid UTF-8 text"
             refs.append(
                 SourceRef(
-                    doc_id=document_id(relative),
+                    doc_id=document_id(self._engagement_id, relative),
                     path=relative,
                     bytes=len(raw),
                     sha256=digest,
@@ -217,7 +254,7 @@ class SourceLibrary:
         """
         resolved, raw = self._read_bytes(relative_path)
         relative = resolved.relative_to(self._root).as_posix()
-        doc_id = document_id(relative)
+        doc_id = document_id(self._engagement_id, relative)
         total = len(raw)
 
         if self.run_bytes_remaining == 0:
@@ -267,9 +304,15 @@ class SourceLibrary:
         """Whether `quote` appears verbatim in the document at `relative_path`.
 
         Reads the document in full, past both byte caps, because the question is about the document
-        and not about what some subagent was shown. It returns a bool and no text, so it is not a
-        way to read a capped document out a substring at a time -- an attacker already holds the
-        candidate string.
+        and not about what some subagent was shown.
+
+        It returns a bool and no text. That is **not** the same as leaking nothing: a caller that
+        can ask many questions can walk a string out of a capped document one character at a time,
+        and measured, 318 queries recovered 36 characters from beyond a 40-byte cap. The control
+        that matters is therefore not this return type but who may call it -- `store.record_claims`
+        is the only caller, it runs under `assert_can`, and it accepts a quote only against a
+        document the claim's own question named. A model never calls this directly, and it has no
+        tool that does.
 
         Verbatim, with exactly two concessions, both of which are encoding rather than wording:
         line endings are normalised to LF, and both sides are NFC-normalised so a decomposed

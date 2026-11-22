@@ -7,7 +7,13 @@ three roles come from the spec:
 | --------- | ------------------------------------------------------------------------------- |
 | `analyst` | read its engagements' sources, run discovery, read a draft readout, trace claims |
 | `lead`    | all of that, plus finalise a readout and run `--live` against Bedrock            |
-| `sponsor` | read a **finalised** readout of its own engagement, and nothing under `sources/` |
+| `sponsor` | read a **finalised** readout of its own engagement, and nothing else at all      |
+
+The sponsor's row is the narrow one, and "nothing else" is load-bearing. `READ_READOUT` means the
+rendered readout and nothing that went into it: not a claim and its verbatim quote, not a question,
+not a subagent run, not the engagement brief. Those are `READ_DISCOVERY`, which no sponsor holds.
+Collapsing the two is the mistake this split exists to prevent -- a `TRACE_CLAIM` refusal is
+decorative if a bulk claim reader beside it returns a superset, unverified claims included.
 
 `assert_can` is pure: it reads only the `Principal` handed to it and the `Resource` describing what
 is being reached. Assignment is resolved once, by `store.load_principal`, into
@@ -47,6 +53,9 @@ class Action(StrEnum):
     LIST_SOURCES = "list_sources"
     READ_SOURCE = "read_source"
     RUN_DISCOVERY = "run_discovery"
+    #: Read the engagement's working material: its brief, its questions, its subagent runs and its
+    #: claims with their quotes. Distinct from READ_READOUT, which is the finished document only.
+    READ_DISCOVERY = "read_discovery"
     READ_READOUT = "read_readout"
     TRACE_CLAIM = "trace_claim"
     FINALISE_READOUT = "finalise_readout"
@@ -60,20 +69,35 @@ class EngagementState(StrEnum):
     FINAL = "final"
 
 
-# What each role may do, stated positively. A role reaches exactly the actions listed for it, so a
-# new `Action` is refused to everyone until it is added here on purpose -- the safe direction. The
-# sponsor's single entry carries a further condition, checked below.
+# What each role may do, stated positively and ENUMERATED -- including the lead's. A new `Action` is
+# then refused to everyone until it is added here on purpose, which is the safe direction and the
+# whole point of writing the table out. `frozenset(Action)` for the lead would have said the
+# opposite of that: it auto-grants whatever anyone adds later, and the lead is the role that can
+# finalise and spend money on Bedrock. `tests/test_access_rules.py` asserts every `Action` appears
+# in this table, so adding one without deciding its roles fails the suite rather than defaulting.
 _ALLOWED: dict[Role, frozenset[Action]] = {
     Role.ANALYST: frozenset(
         {
             Action.LIST_SOURCES,
             Action.READ_SOURCE,
             Action.RUN_DISCOVERY,
+            Action.READ_DISCOVERY,
             Action.READ_READOUT,
             Action.TRACE_CLAIM,
         }
     ),
-    Role.LEAD: frozenset(Action),
+    Role.LEAD: frozenset(
+        {
+            Action.LIST_SOURCES,
+            Action.READ_SOURCE,
+            Action.RUN_DISCOVERY,
+            Action.READ_DISCOVERY,
+            Action.READ_READOUT,
+            Action.TRACE_CLAIM,
+            Action.FINALISE_READOUT,
+            Action.RUN_LIVE,
+        }
+    ),
     Role.SPONSOR: frozenset({Action.READ_READOUT}),
 }
 

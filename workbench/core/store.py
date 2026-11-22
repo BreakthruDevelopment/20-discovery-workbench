@@ -61,6 +61,30 @@ SPECIALISTS = frozenset({"process", "systems", "data", "change"})
 READOUT_DRAFT = "draft"
 READOUT_FINAL = "final"
 
+#: Free-text caps, enforced at the boundary. Not decoration: a question's text and a claim's text
+#: both flow into 20.5's synthesis prompt, which has a 12,000-character input cap of its own, so an
+#: unbounded field here is a prompt that silently loses its tail -- or an input that crowds the
+#: real evidence out. NUL is rejected outright: SQLite stores it, Postgres cannot, and app 20's
+#: sibling repos learned that one as a 500.
+MAX_TEXT_CHARS = 2_000
+MAX_RATIONALE_CHARS = 1_000
+
+
+def _text(value: str, *, field: str, limit: int) -> str:
+    """A free-text field, trimmed, length-capped and NUL-free, or `InvalidInput`.
+
+    The message names the FIELD, never the value: `field` is a schema-derived name supplied by the
+    accessor, so a refusal cannot hand a caller's own text back to it.
+    """
+    trimmed = value.strip()
+    if not trimmed:
+        raise InvalidInput(f"{field} is required")
+    if "\x00" in trimmed:
+        raise InvalidInput(f"{field} contains no NUL byte")
+    if len(trimmed) > limit:
+        raise InvalidInput(f"{field} is at most {limit} characters")
+    return trimmed
+
 
 @dataclass(frozen=True, slots=True)
 class Engagement:
@@ -293,8 +317,20 @@ class Store:
         return engagement
 
     def engagement(self, principal: Principal, engagement_id: str) -> Engagement:
-        """One engagement, for a principal that may read its readout."""
-        return self._authorise(principal, Action.READ_READOUT, engagement_id)
+        """One engagement, including its brief. `READ_DISCOVERY`, so no sponsor reaches it."""
+        return self._authorise(principal, Action.READ_DISCOVERY, engagement_id)
+
+    def engagement_summary(
+        self, principal: Principal, engagement_id: str
+    ) -> tuple[str, str, EngagementState]:
+        """`(id, client, state)` and nothing else: what a readout header needs.
+
+        The narrow surface a `sponsor` may have. It deliberately omits `brief` and
+        `sponsor_principal`, so rendering a finalised readout for a sponsor never needs
+        `engagement()` and therefore never needs `READ_DISCOVERY`.
+        """
+        engagement = self._authorise(principal, Action.READ_READOUT, engagement_id)
+        return engagement.id, engagement.client, engagement.state
 
     def engagement_ids(self, principal: Principal) -> tuple[str, ...]:
         """The engagements this principal is assigned to, sorted. No row data."""
@@ -308,21 +344,52 @@ class Store:
         """Rebuild `source_document` for one engagement from its source library.
 
         The index is derived, never authored: ids and digests come from the tree, so re-indexing an
-        unchanged tree writes the same rows. Rows for documents that have disappeared are deleted,
-        which is why this runs in one transaction -- a half-updated index would let a stale
-        `doc_id` be followed.
+        unchanged tree writes the same rows.
+
+        **Upsert, not delete-and-reinsert.** `claim.doc_id` has a foreign key to this table and
+        SQLite enforces it immediately, so clearing the engagement's rows first raised a raw
+        `sqlite3.IntegrityError` -- outside `errors.py`, so with no `error_category` and no way for
+        a caller to react -- the moment a second `wb discover` ran after any claim existed. Which
+        is an ordinary sequence, not an edge case.
+
+        A row whose document has disappeared from the tree is deleted **only if no claim cites
+        it**. One that is cited stays, because `wb trace` has to resolve the document a claim
+        names, and the recorded path and digest are the record of what that document was; reading
+        it then fails as `source_unreadable`, which is the honest answer. All in one transaction,
+        so a half-updated index can never be followed.
         """
         self._authorise(principal, Action.LIST_SOURCES, engagement_id)
+        if library.engagement_id != engagement_id:
+            # The last piece of the owner filter that could otherwise sit in a caller: with the
+            # wrong library, this would write another engagement's documents into this index and
+            # `document_path` would hand them straight back.
+            raise InvalidInput("the source library is rooted at a different engagement")
         refs = tuple(library.list_documents())
         with self._transaction() as connection:
-            connection.execute(
-                "DELETE FROM source_document WHERE engagement_id = ?", (engagement_id,)
-            )
             connection.executemany(
                 "INSERT INTO source_document (id, engagement_id, path, sha256, bytes) "
-                "VALUES (?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(id) DO UPDATE SET path = excluded.path, "
+                "sha256 = excluded.sha256, bytes = excluded.bytes",
                 [(ref.doc_id, engagement_id, ref.path, ref.sha256, ref.bytes) for ref in refs],
             )
+            current = {ref.doc_id for ref in refs}
+            recorded = {
+                str(row["id"])
+                for row in connection.execute(
+                    "SELECT id FROM source_document WHERE engagement_id = ?", (engagement_id,)
+                ).fetchall()
+            }
+            # One fully parameterised statement per stale id, rather than a generated `IN (...)`
+            # list: no SQL text is ever built from data, there is no `IN ()` empty-list special
+            # case, and an index is dozens of files. The `NOT IN (SELECT doc_id ...)` is what
+            # keeps a row a claim still cites.
+            for doc_id in sorted(recorded - current):
+                connection.execute(
+                    "DELETE FROM source_document WHERE engagement_id = ? AND id = ? "
+                    "AND id NOT IN (SELECT doc_id FROM claim WHERE engagement_id = ?)",
+                    (engagement_id, doc_id, engagement_id),
+                )
         return refs
 
     def source_documents(self, principal: Principal, engagement_id: str) -> tuple[SourceRef, ...]:
@@ -373,13 +440,25 @@ class Store:
         """
         self._authorise(principal, Action.RUN_DISCOVERY, engagement_id)
         planned = list(questions)
+        checked: list[NewQuestion] = []
         for question in planned:
             if question.specialist not in SPECIALISTS:
                 raise InvalidInput("specialist is outside the closed set")
             if not question.doc_ids:
                 raise InvalidInput("a question names at least one document")
-            if not question.text.strip() or not question.rationale.strip():
-                raise InvalidInput("a question carries text and a rationale")
+            checked.append(
+                NewQuestion(
+                    text=_text(question.text, field="question.text", limit=MAX_TEXT_CHARS),
+                    specialist=question.specialist,
+                    doc_ids=tuple(question.doc_ids),
+                    rationale=_text(
+                        question.rationale,
+                        field="question.rationale",
+                        limit=MAX_RATIONALE_CHARS,
+                    ),
+                )
+            )
+        planned = checked
 
         recorded: list[Question] = []
         with self._transaction() as connection:
@@ -429,8 +508,8 @@ class Store:
         return tuple(recorded)
 
     def questions(self, principal: Principal, engagement_id: str) -> tuple[Question, ...]:
-        """This engagement's questions, in plan order."""
-        self._authorise(principal, Action.READ_READOUT, engagement_id)
+        """This engagement's questions, in plan order. `READ_DISCOVERY`: not a sponsor's to see."""
+        self._authorise(principal, Action.READ_DISCOVERY, engagement_id)
         rows = self._connection.execute(
             "SELECT id, engagement_id, seq, text, specialist, doc_ids, rationale "
             "FROM question WHERE engagement_id = ? ORDER BY seq",
@@ -505,7 +584,7 @@ class Store:
 
     def subagent_runs(self, principal: Principal, engagement_id: str) -> tuple[SubagentRun, ...]:
         """Every subagent run of this engagement, joined through `question` for the owner filter."""
-        self._authorise(principal, Action.READ_READOUT, engagement_id)
+        self._authorise(principal, Action.READ_DISCOVERY, engagement_id)
         rows = self._connection.execute(
             "SELECT r.id, r.question_id, r.state, r.error_category, r.is_retryable, "
             "r.turns, r.tokens FROM subagent_run AS r "
@@ -544,8 +623,16 @@ class Store:
         quoting text that is not in its document is still recorded -- `wb trace` must be able to
         show it, and 20.5 excludes it from synthesis -- but it is recorded as `verified: false`,
         and nothing a caller or a model passes in can change that.
+
+        **A claim may only cite a document its own question named.** Scoped context passing is the
+        boundary: a subagent is handed its question's documents and nothing else, so a finding
+        citing a document that question never named did not come from what the subagent was shown.
+        Checking only "is it in this engagement" would let one subagent's answer reach across to
+        another's evidence, which is the same leak as crossing engagements, one level down.
         """
         self._authorise(principal, Action.RUN_DISCOVERY, engagement_id)
+        if library.engagement_id != engagement_id:
+            raise InvalidInput("the source library is rooted at a different engagement")
         incoming = list(claims)
         recorded: list[Claim] = []
         with self._transaction() as connection:
@@ -559,13 +646,15 @@ class Store:
             for claim in incoming:
                 if not 0.0 <= claim.confidence <= 1.0:
                     raise InvalidInput("confidence is between 0 and 1")
-                if not claim.text.strip():
-                    raise InvalidInput("a claim carries text")
+                text = _text(claim.text, field="claim.text", limit=MAX_TEXT_CHARS)
+                quote = _text(claim.quote, field="claim.quote", limit=MAX_TEXT_CHARS)
                 self._assert_question_in_engagement(connection, engagement_id, claim.question_id)
+                if claim.doc_id not in self._question_doc_ids(connection, claim.question_id):
+                    raise InvalidInput("a claim cites a document its question did not name")
                 path = paths.get(claim.doc_id)
                 if path is None:
                     raise InvalidInput("a claim names a document outside this engagement")
-                verified = _quote_checks_out(library, path, claim.quote)
+                verified = _quote_checks_out(library, path, quote)
                 claim_id = self._new_id()
                 connection.execute(
                     "INSERT INTO claim "
@@ -575,9 +664,9 @@ class Store:
                         claim_id,
                         engagement_id,
                         claim.question_id,
-                        claim.text,
+                        text,
                         claim.doc_id,
-                        claim.quote,
+                        quote,
                         1 if verified else 0,
                         claim.confidence,
                     ),
@@ -587,9 +676,9 @@ class Store:
                         id=claim_id,
                         engagement_id=engagement_id,
                         question_id=claim.question_id,
-                        text=claim.text,
+                        text=text,
                         doc_id=claim.doc_id,
-                        quote=claim.quote,
+                        quote=quote,
                         verified=verified,
                         confidence=claim.confidence,
                     )
@@ -599,8 +688,15 @@ class Store:
     def claims(
         self, principal: Principal, engagement_id: str, *, verified_only: bool = False
     ) -> tuple[Claim, ...]:
-        """This engagement's claims. `verified_only` is what synthesis reads."""
-        self._authorise(principal, Action.READ_READOUT, engagement_id)
+        """This engagement's claims, with their verbatim quotes. `verified_only` is what synthesis
+        reads.
+
+        `READ_DISCOVERY`, not `READ_READOUT`. A claim and its quote are the evidence behind the
+        readout, not the readout: a sponsor that could call this would hold, in bulk, exactly what
+        the `TRACE_CLAIM` refusal beside it exists to withhold -- and would get the *unverified*
+        claims too, which are the ones the product exists to keep out of a readout.
+        """
+        self._authorise(principal, Action.READ_DISCOVERY, engagement_id)
         if verified_only:
             rows = self._connection.execute(
                 "SELECT id, engagement_id, question_id, text, doc_id, quote, verified, confidence "
@@ -707,18 +803,8 @@ class Store:
         Latest, not any: a question retried successfully is answered. The latest run per question
         is the highest `rowid`, which is insertion order.
         """
-        self._authorise(principal, Action.READ_READOUT, engagement_id)
-        rows = self._connection.execute(
-            "SELECT q.id AS question_id, ("
-            "  SELECT r.state FROM subagent_run AS r "
-            "  WHERE r.question_id = q.id ORDER BY r.rowid DESC LIMIT 1"
-            ") AS latest_state "
-            "FROM question AS q WHERE q.engagement_id = ? ORDER BY q.seq",
-            (engagement_id,),
-        ).fetchall()
-        return tuple(
-            str(row["question_id"]) for row in rows if str(row["latest_state"]) == "failed"
-        )
+        self._authorise(principal, Action.READ_DISCOVERY, engagement_id)
+        return _failed_question_ids(self._connection, engagement_id)
 
     def finalise(
         self, principal: Principal, engagement_id: str, *, accept_gaps: bool = False
@@ -733,17 +819,21 @@ class Store:
         * **Twice.** `finalisation.engagement_id` is the primary key, so a second finalise is
           refused by the database. The `IntegrityError` is mapped to `AlreadyFinal` here; no caller
           checks "is it already final" and then acts, which is the check that races.
+
+        The gap check runs **inside** the write transaction, after `BEGIN IMMEDIATE`. Outside it,
+        a subagent run that failed between the check and the insert produced a `final` readout with
+        an unaccepted gap in it -- the one state `--accept-gaps` exists to make impossible.
         """
         self._authorise(principal, Action.FINALISE_READOUT, engagement_id)
-        gaps = self.failed_run_question_ids(principal, engagement_id)
-        if gaps and not accept_gaps:
-            raise CoverageGapsPresent(
-                f"{len(gaps)} question(s) have a failed subagent run; "
-                "finalising over them requires accept_gaps"
-            )
         stamp = self._now().isoformat()
         try:
             with self._transaction() as connection:
+                gaps = _failed_question_ids(connection, engagement_id)
+                if gaps and not accept_gaps:
+                    raise CoverageGapsPresent(
+                        f"{len(gaps)} question(s) have a failed subagent run; "
+                        "finalising over them requires accept_gaps"
+                    )
                 connection.execute(
                     "INSERT INTO finalisation "
                     "(engagement_id, finalised_by, accept_gaps, finalised_at) "
@@ -764,7 +854,7 @@ class Store:
 
     def finalisation_accepted_gaps(self, principal: Principal, engagement_id: str) -> bool:
         """Whether this engagement was finalised with `--accept-gaps`. `NotFound` if it is open."""
-        self._authorise(principal, Action.READ_READOUT, engagement_id)
+        self._authorise(principal, Action.READ_DISCOVERY, engagement_id)
         row = self._connection.execute(
             "SELECT accept_gaps FROM finalisation WHERE engagement_id = ?", (engagement_id,)
         ).fetchone()
@@ -773,6 +863,16 @@ class Store:
         return bool(row["accept_gaps"])
 
     # ---- helpers --------------------------------------------------------------------------
+
+    @staticmethod
+    def _question_doc_ids(connection: sqlite3.Connection, question_id: str) -> frozenset[str]:
+        """The documents one question named, as recorded in its own row."""
+        row = connection.execute(
+            "SELECT doc_ids FROM question WHERE id = ?", (question_id,)
+        ).fetchone()
+        if row is None:
+            raise InvalidInput("a question id outside this engagement")
+        return frozenset(_json_string_list(str(row["doc_ids"])))
 
     @staticmethod
     def _assert_question_in_engagement(
@@ -784,6 +884,20 @@ class Store:
         ).fetchone()
         if row is None:
             raise InvalidInput("a question id outside this engagement")
+
+
+def _failed_question_ids(connection: sqlite3.Connection, engagement_id: str) -> tuple[str, ...]:
+    """The questions whose LATEST subagent run failed. Takes a connection so `finalise` can run it
+    inside its own transaction and `failed_run_question_ids` can run it outside one."""
+    rows = connection.execute(
+        "SELECT q.id AS question_id, ("
+        "  SELECT r.state FROM subagent_run AS r "
+        "  WHERE r.question_id = q.id ORDER BY r.rowid DESC LIMIT 1"
+        ") AS latest_state "
+        "FROM question AS q WHERE q.engagement_id = ? ORDER BY q.seq",
+        (engagement_id,),
+    ).fetchall()
+    return tuple(str(row["question_id"]) for row in rows if str(row["latest_state"]) == "failed")
 
 
 def _claim_from_row(row: sqlite3.Row) -> Claim:

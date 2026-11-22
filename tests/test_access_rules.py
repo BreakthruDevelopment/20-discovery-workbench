@@ -222,3 +222,41 @@ def test_scope_is_checked_before_role() -> None:
     with pytest.raises(AccessDenied) as refusal:
         assert_can(sponsor, Action.READ_READOUT, Resource(NORTHWIND, EngagementState.FINAL))
     assert "not assigned" in str(refusal.value)
+
+
+def test_every_action_appears_in_the_allowed_table() -> None:
+    """The lead's row is enumerated, not `frozenset(Action)`: a new `Action` must be decided on,
+    not auto-granted to the role that can finalise and spend money on Bedrock."""
+    from workbench.core.principals import _ALLOWED
+
+    assert set(_ALLOWED) == set(Role)
+    for action in Action:
+        assert any(action in allowed for allowed in _ALLOWED.values()), (
+            f"{action.value} is in no role's set; decide its roles rather than leaving it orphaned"
+        )
+
+
+def test_the_lead_set_is_pinned_rather_than_derived() -> None:
+    """Pinned to a literal here as well as enumerated there, so adding an `Action` cannot widen
+    the lead's reach by default -- it fails the test above as orphaned, or this one as a surprise.
+    """
+    from workbench.core.principals import _ALLOWED
+
+    assert _ALLOWED[Role.LEAD] == frozenset(
+        {
+            Action.LIST_SOURCES,
+            Action.READ_SOURCE,
+            Action.RUN_DISCOVERY,
+            Action.READ_DISCOVERY,
+            Action.READ_READOUT,
+            Action.TRACE_CLAIM,
+            Action.FINALISE_READOUT,
+            Action.RUN_LIVE,
+        }
+    )
+
+
+def test_a_sponsor_holds_exactly_one_action() -> None:
+    from workbench.core.principals import _ALLOWED
+
+    assert _ALLOWED[Role.SPONSOR] == frozenset({Action.READ_READOUT})

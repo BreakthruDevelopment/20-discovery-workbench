@@ -22,8 +22,12 @@ from workbench.core.sources import MIN_QUOTE_CHARS, SourceLibrary
 CLERK = "interviews/ap-clerk.md"
 
 
-def _library(root: Path, *, file_cap: int = 4_096, run_cap: int = 16_384) -> SourceLibrary:
-    return SourceLibrary(root, max_file_bytes=file_cap, max_run_bytes=run_cap)
+def _library(
+    root: Path, *, engagement_id: str = ACME, file_cap: int = 4_096, run_cap: int = 16_384
+) -> SourceLibrary:
+    return SourceLibrary(
+        root, engagement_id=engagement_id, max_file_bytes=file_cap, max_run_bytes=run_cap
+    )
 
 
 # ---- the index ----------------------------------------------------------------------------
@@ -213,7 +217,12 @@ def test_a_trim_inside_a_multibyte_character_does_not_fail(tmp_path: Path) -> No
 
 def test_a_nonpositive_cap_is_refused(tmp_path: Path) -> None:
     with pytest.raises(InvalidInput):
-        SourceLibrary(tmp_path, max_file_bytes=0, max_run_bytes=10)
+        SourceLibrary(tmp_path, engagement_id=ACME, max_file_bytes=0, max_run_bytes=10)
+
+
+def test_a_library_is_rooted_at_one_named_engagement(tmp_path: Path) -> None:
+    with pytest.raises(InvalidInput):
+        SourceLibrary(tmp_path, engagement_id="  ", max_file_bytes=10, max_run_bytes=10)
 
 
 # ---- verify_quote -------------------------------------------------------------------------
@@ -275,3 +284,48 @@ def test_crlf_line_endings_do_not_defeat_a_quote(tmp_path: Path) -> None:
     root.mkdir()
     (root / "dos.md").write_bytes(b"A sentence split\r\nover two lines of evidence.\r\n")
     assert _library(root).verify_quote("dos.md", "A sentence split\nover two lines") is True
+
+
+# ---- regressions from the first review round ------------------------------------------------
+
+
+def test_a_document_id_carries_its_engagement(fixture: Fixture) -> None:
+    from workbench.core.sources import document_id
+
+    assert document_id("acme-p2p", "a.md") != document_id("northwind-ar", "a.md")
+
+
+def test_a_document_id_is_injective_over_separators() -> None:
+    """Collapsing `/` and `.` into `-` made `a/b.md` and `a--b.md` the same id."""
+    from workbench.core.sources import document_id
+
+    paths = ["a/b.md", "a--b.md", "x.y.md", "x-y.md", "a/b/c.md", "a--b--c.md"]
+    ids = [document_id(ACME, path) for path in paths]
+    assert len(set(ids)) == len(paths)
+
+
+def test_a_symlink_named_like_a_document_cannot_surface_the_manifest(tmp_path: Path) -> None:
+    """`_entries` screened the link's own name, `_resolve` the resolved one: a link named
+    `notes.md` pointing at `manifest.json` was listed with the manifest's real size and digest."""
+    root = tmp_path / "pack"
+    root.mkdir()
+    (root / "manifest.json").write_text('{"planted_facts": ["the answer key"]}\n', encoding="utf-8")
+    (root / "notes.md").symlink_to(root / "manifest.json")
+    library = _library(root)
+    assert library.list_documents() == []
+    with pytest.raises(SourceRefused):
+        library.read("notes.md")
+
+
+def test_a_symlinked_directory_component_out_of_the_root_is_refused(tmp_path: Path) -> None:
+    """The variant people get wrong: the escape is a directory, not the file."""
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    (outside / "notes.md").write_text("another engagement's evidence entirely\n", encoding="utf-8")
+    root = tmp_path / "pack"
+    root.mkdir()
+    (root / "linked").symlink_to(outside, target_is_directory=True)
+    library = _library(root)
+    with pytest.raises(SourceOutsideRoot):
+        library.read("linked/notes.md")
+    assert library.list_documents() == []

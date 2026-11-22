@@ -67,6 +67,15 @@ def _write_tree(root: Path) -> None:
     (northwind / "ar-notes.md").write_text(f"# AR notes\n\n{NORTHWIND_QUOTE}\n", encoding="utf-8")
 
 
+def _library_for(config: Config, engagement_id: str) -> SourceLibrary:
+    return SourceLibrary(
+        config.engagement_sources_root(engagement_id),
+        engagement_id=engagement_id,
+        max_file_bytes=config.max_source_file_bytes,
+        max_run_bytes=config.max_source_run_bytes,
+    )
+
+
 @pytest.fixture
 def fixture(tmp_path: Path) -> Iterator[Fixture]:
     sources_root = tmp_path / "sources"
@@ -87,16 +96,8 @@ def fixture(tmp_path: Path) -> Iterator[Fixture]:
         yield Fixture(
             store=store,
             config=config,
-            acme_library=SourceLibrary(
-                config.engagement_sources_root(ACME),
-                max_file_bytes=config.max_source_file_bytes,
-                max_run_bytes=config.max_source_run_bytes,
-            ),
-            northwind_library=SourceLibrary(
-                config.engagement_sources_root(NORTHWIND),
-                max_file_bytes=config.max_source_file_bytes,
-                max_run_bytes=config.max_source_run_bytes,
-            ),
+            acme_library=_library_for(config, ACME),
+            northwind_library=_library_for(config, NORTHWIND),
         )
 
 

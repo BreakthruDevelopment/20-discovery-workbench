@@ -377,3 +377,161 @@ def test_a_saved_readout_round_trips_and_roi_may_stay_null(
     )
     assert saved.roi is None
     assert fixture.store.readout(analyst, ACME).maturity == saved.maturity
+
+
+# ---- regressions from the first review round --------------------------------------------------
+
+
+def test_reindexing_after_a_claim_exists_does_not_raise(
+    fixture: Fixture, analyst: Principal
+) -> None:
+    """`claim.doc_id` has a foreign key to `source_document`, so the first version's
+    delete-and-reinsert raised a raw `sqlite3.IntegrityError` -- outside `errors.py` entirely --
+    the moment a second `wb discover` ran after any claim existed."""
+    index = _index(fixture, analyst, ACME)
+    question_id = _one_question(fixture, analyst, index[CLERK])
+    fixture.store.record_claims(
+        analyst,
+        ACME,
+        [NewClaim(question_id, "Matching is manual.", index[CLERK], ACME_QUOTE, 0.9)],
+        fixture.acme_library,
+    )
+    assert _index(fixture, analyst, ACME) == index
+
+
+def test_reindexing_keeps_a_row_a_claim_still_cites(fixture: Fixture, analyst: Principal) -> None:
+    """A document that leaves the tree while a claim cites it keeps its row, so `wb trace` can
+    still resolve what the claim named; reading it then fails honestly instead."""
+    index = _index(fixture, analyst, ACME)
+    question_id = _one_question(fixture, analyst, index[CLERK])
+    fixture.store.record_claims(
+        analyst,
+        ACME,
+        [NewClaim(question_id, "Matching is manual.", index[CLERK], ACME_QUOTE, 0.9)],
+        fixture.acme_library,
+    )
+    (fixture.config.engagement_sources_root(ACME) / CLERK).unlink()
+    refs = fixture.store.index_sources(analyst, ACME, fixture.acme_library)
+    assert CLERK not in {ref.path for ref in refs}
+    # Still recorded, because a claim cites it.
+    assert fixture.store.document_path(analyst, ACME, index[CLERK]) == CLERK
+
+
+def test_reindexing_drops_a_row_nothing_cites(fixture: Fixture, analyst: Principal) -> None:
+    index = _index(fixture, analyst, ACME)
+    (fixture.config.engagement_sources_root(ACME) / CLERK).unlink()
+    _index(fixture, analyst, ACME)
+    with pytest.raises(NotFound):
+        fixture.store.document_path(analyst, ACME, index[CLERK])
+
+
+def test_reindexing_an_emptied_tree_does_not_raise(fixture: Fixture, analyst: Principal) -> None:
+    """The empty case: `id NOT IN ()` is a syntax error in SQLite, so it has its own branch."""
+    _index(fixture, analyst, ACME)
+    root = fixture.config.engagement_sources_root(ACME)
+    for path in sorted(root.rglob("*")):
+        if path.is_file():
+            path.unlink()
+    assert fixture.store.index_sources(analyst, ACME, fixture.acme_library) == ()
+
+
+def test_two_engagements_may_hold_the_same_filename(
+    fixture: Fixture, analyst: Principal, other_analyst: Principal
+) -> None:
+    """`source_document.id` is a database-wide primary key, so an id derived from the path alone
+    collided the moment both engagements held a `systems-inventory.csv` -- which the spec's own
+    pack filename makes likely."""
+    northwind_root = fixture.config.engagement_sources_root(NORTHWIND)
+    (northwind_root / "systems-inventory.csv").write_text(
+        "system,owner,notes\nAS400,IT,remittance import\n", encoding="utf-8"
+    )
+    acme = _index(fixture, analyst, ACME)
+    northwind = _index(fixture, other_analyst, NORTHWIND)
+    assert acme["systems-inventory.csv"] != northwind["systems-inventory.csv"]
+    assert len(fixture.store.source_documents(analyst, ACME)) == 2
+    assert len(fixture.store.source_documents(other_analyst, NORTHWIND)) == 2
+
+
+def test_the_wrong_library_cannot_index_an_engagement(fixture: Fixture, analyst: Principal) -> None:
+    """The last piece of the owner filter that could have lived in a caller."""
+    with pytest.raises(InvalidInput):
+        fixture.store.index_sources(analyst, ACME, fixture.northwind_library)
+    assert fixture.store.source_documents(analyst, ACME) == ()
+
+
+def test_the_wrong_library_cannot_verify_a_claim(fixture: Fixture, analyst: Principal) -> None:
+    index = _index(fixture, analyst, ACME)
+    question_id = _one_question(fixture, analyst, index[CLERK])
+    with pytest.raises(InvalidInput):
+        fixture.store.record_claims(
+            analyst,
+            ACME,
+            [NewClaim(question_id, "t", index[CLERK], ACME_QUOTE, 0.5)],
+            fixture.northwind_library,
+        )
+
+
+def test_a_claim_may_not_cite_a_document_its_question_did_not_name(
+    fixture: Fixture, analyst: Principal
+) -> None:
+    """Scoped context passing is a boundary per subagent, not only per engagement: a finding
+    citing a document its question never named did not come from what that subagent was shown."""
+    index = _index(fixture, analyst, ACME)
+    question_id = _one_question(fixture, analyst, index[CLERK])
+    with pytest.raises(InvalidInput):
+        fixture.store.record_claims(
+            analyst,
+            ACME,
+            [
+                NewClaim(
+                    question_id,
+                    "from a document this question never named",
+                    index["systems-inventory.csv"],
+                    ACME_QUOTE,
+                    0.5,
+                )
+            ],
+            fixture.acme_library,
+        )
+    assert fixture.store.claims(analyst, ACME) == ()
+
+
+def test_free_text_is_length_capped(fixture: Fixture, analyst: Principal) -> None:
+    index = _index(fixture, analyst, ACME)
+    with pytest.raises(InvalidInput):
+        fixture.store.record_questions(
+            analyst, ACME, [NewQuestion("q" * 5_000, "process", [index[CLERK]], "r")]
+        )
+    question_id = _one_question(fixture, analyst, index[CLERK])
+    with pytest.raises(InvalidInput):
+        fixture.store.record_claims(
+            analyst,
+            ACME,
+            [NewClaim(question_id, "c" * 5_000, index[CLERK], ACME_QUOTE, 0.5)],
+            fixture.acme_library,
+        )
+
+
+def test_a_nul_byte_in_free_text_is_refused(fixture: Fixture, analyst: Principal) -> None:
+    """SQLite stores a NUL; Postgres cannot, and these fields feed 20.5's synthesis prompt."""
+    index = _index(fixture, analyst, ACME)
+    with pytest.raises(InvalidInput):
+        fixture.store.record_questions(
+            analyst, ACME, [NewQuestion("q\x00uestion", "process", [index[CLERK]], "r")]
+        )
+    question_id = _one_question(fixture, analyst, index[CLERK])
+    with pytest.raises(InvalidInput):
+        fixture.store.record_claims(
+            analyst,
+            ACME,
+            [NewClaim(question_id, "cl\x00aim", index[CLERK], ACME_QUOTE, 0.5)],
+            fixture.acme_library,
+        )
+
+
+def test_free_text_is_trimmed(fixture: Fixture, analyst: Principal) -> None:
+    index = _index(fixture, analyst, ACME)
+    (question,) = fixture.store.record_questions(
+        analyst, ACME, [NewQuestion("  padded  ", "process", [index[CLERK]], "  why  ")]
+    )
+    assert (question.text, question.rationale) == ("padded", "why")

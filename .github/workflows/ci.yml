@@ -64,8 +64,10 @@ jobs:
           /tmp/wheel-check/bin/python -P -c "from workbench.core import store; \
             assert store._SCHEMA_PATH.is_file() and store._SEED_PATH.is_file()"
       - name: Smoke test (installed CLI)
-        # PYTHONSAFEPATH is the console script's `-P`: the `wb` entry point is a script in the
-        # venv, so without it cwd-adjacent imports win here too.
+        # PYTHONSAFEPATH is the console script's `-P`. Belt and braces rather than a fix: a
+        # console script's own sys.path[0] is /tmp/wheel-check/bin, never the checkout root, so
+        # this step was already proving the installed CLI. It costs nothing and removes the need
+        # to re-derive that for the next person who moves this step.
         env:
           PYTHONSAFEPATH: "1"
         run: |
