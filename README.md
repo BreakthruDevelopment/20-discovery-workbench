@@ -6,9 +6,11 @@ which every claim carries a verbatim, checked quote and every failed subagent is
 
 ## What this app does
 
-Slice 20.1 is scaffolding only: the Python package (`workbench`, command `wb`), CI, the Dockerfile and the pin to
-app 17 at tag `v0.1.0`. The engagement store, access rules, source library, discovery pack, coordinator and readout
-arrive in later slices; this section is completed when they land. See `AGENTS.md` for the rules.
+The package is `workbench` and the command is `wb`. App 17 is pinned at tag `v0.1.0`. The synthetic discovery
+pack at `sources/acme-p2p/` is committed evidence for a fictional procure-to-pay engagement: four interview
+transcripts, a system inventory, a 12-row ticket extract and two memos, written by the pack's generator from
+`manifest.json`. The engagement store, access rules, source library, coordinator and readout arrive in later
+slices. See `AGENTS.md` for the rules.
 
 ## Develop
 
