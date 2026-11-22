@@ -11,17 +11,20 @@ import asyncio
 import pytest
 from agent_container.core.budget import Budget
 from agent_container.core.loop import MAX_USER_MESSAGE_CHARS
+from agent_container.core.messages import ModelRequest, ModelResponse
+from agent_container.core.provider import ModelProvider
 from agent_container.core.tool import ToolContext
 
 from tests.conftest_pack import (
     ACME,
     CLERK,
     FIXTURE,
+    MATCHING,
     POLICY,
     RECEIVING,
     Pack,
 )
-from tests.recordings import recording_source
+from tests.recordings import answer, answering_specialist, finding, recording_source
 from workbench.coordinator.coordinator import (
     DiscoveryCoordinator,
     DiscoveryRun,
@@ -64,7 +67,7 @@ def test_the_recorded_run_is_the_shape_the_spec_describes(
     assert result.replanned is False
 
 
-def test_the_run_is_identical_twice(pack: Pack, pack_analyst: Principal) -> None:
+def test_the_run_is_recorded_in_plan_order(pack: Pack, pack_analyst: Principal) -> None:
     """A recorded demo that is not deterministic is not a demo."""
     first = _run(pack, pack_analyst)
     assert [q.text for q in first.questions] == [
@@ -77,6 +80,70 @@ def test_the_run_is_identical_twice(pack: Pack, pack_analyst: Principal) -> None
         (4, "ok"),
         (5, "failed"),
     ]
+
+
+def test_a_second_run_against_the_same_database_replays_the_same_way(
+    pack: Pack, pack_analyst: Principal
+) -> None:
+    """The recording is keyed by plan position, not by `question.seq`.
+
+    `record_questions` continues the engagement's numbering, so the second run's questions are
+    seq 6-10. Keyed by `seq`, every one of them would miss the recording and fail, turning a
+    recorded five-subagent demo into five provider failures on its second invocation -- and
+    `wb demo` run twice is the first thing anyone does.
+    """
+    first = _run(pack, pack_analyst)
+    second = _run(pack, pack_analyst)
+
+    assert [o.state for o in second.outcomes] == [o.state for o in first.outcomes]
+    assert [o.seq for o in second.outcomes] == [6, 7, 8, 9, 10]
+    assert [o.specialist for o in second.outcomes] == [o.specialist for o in first.outcomes]
+    assert [o.findings_recorded for o in second.outcomes] == [
+        o.findings_recorded for o in first.outcomes
+    ]
+    runs = pack.store.subagent_runs(pack_analyst, ACME)
+    assert sorted(run.state for run in runs) == ["failed"] * 2 + ["ok"] * 8
+
+
+def test_a_dropped_question_leaves_the_survivor_answered(
+    pack: Pack, pack_analyst: Principal
+) -> None:
+    """Position is counted over the questions that survived the screen, and so is `seq`.
+
+    `record_questions` numbers only the kept questions, so the two agree here -- this test
+    pins that agreement rather than distinguishing the two keys (the second-run test above is
+    what does that), and would catch a screen that recorded a dropped question or a position
+    counted over the unscreened plan.
+    """
+    source = recording_source(
+        plan_payload={
+            "questions": [
+                {
+                    "text": "a question about the other engagement",
+                    "specialist": "process",
+                    "doc_ids": ["doc-northwind-ar--ar-notes-md-deadbeef"],
+                    "rationale": "because",
+                },
+                {
+                    "text": "how is matching done?",
+                    "specialist": "process",
+                    "doc_ids": [CLERK],
+                    "rationale": "because",
+                },
+            ],
+            "strategy_note": "a note",
+        },
+        specialists={
+            "1": answering_specialist(
+                [CLERK],
+                answer([finding(claim="matching is manual", doc_id=CLERK, quote=MATCHING)]),
+            ),
+        },
+    )
+    result = asyncio.run(pack.coordinator(source).discover(pack_analyst, ACME, budget=_budget()))
+    assert len(result.dropped) == 1
+    assert [o.state for o in result.outcomes] == ["ok"]
+    assert result.outcomes[0].findings_recorded == 1
 
 
 def test_every_question_and_run_is_recorded(pack: Pack, pack_analyst: Principal) -> None:
@@ -334,3 +401,67 @@ def test_each_subagent_gets_its_own_child_budget(pack: Pack, pack_analyst: Princ
     assert budget.tokens_used > 0
     # The parent saw everything the children spent.
     assert budget.tokens_used >= result.tokens_used
+
+
+# ---- cancellation --------------------------------------------------------------------------
+
+
+class _HangingProvider(ModelProvider):
+    """A subagent provider that never answers. It signals that it was reached, then waits."""
+
+    def __init__(self, started: asyncio.Event) -> None:
+        self._started = started
+
+    async def converse(self, request: ModelRequest) -> ModelResponse:
+        self._started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+
+class _HangingSource:
+    """The committed plan, then subagents that hang. A `ProviderSource`, structurally."""
+
+    def __init__(self, plan: ReplaySource, started: asyncio.Event) -> None:
+        self._plan = plan
+        self._started = started
+
+    def plan_provider(self) -> ModelProvider:
+        return self._plan.plan_provider()
+
+    def specialist_provider(self, position: int) -> ModelProvider:
+        return _HangingProvider(self._started)
+
+
+def test_a_cancelled_run_still_records_every_subagent(pack: Pack, pack_analyst: Principal) -> None:
+    """Cancelling the run leaves no persisted question without a `subagent_run` row.
+
+    `asyncio.gather(..., return_exceptions=True)` re-raises `CancelledError` when the gather
+    itself is cancelled, however carefully each child catches its own. Without the handler the
+    recording loop is skipped entirely and five questions sit in the database with no runs --
+    a readout built from those rows would count five answered questions and name no gap, which
+    is exactly the silent disappearance 5.3 forbids.
+    """
+    started = asyncio.Event()
+    source = _HangingSource(ReplaySource.from_file(FIXTURE), started)
+
+    async def main() -> None:
+        task = asyncio.create_task(
+            pack.coordinator(source).discover(pack_analyst, ACME, budget=_budget())
+        )
+        await asyncio.wait_for(started.wait(), timeout=5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(main())
+
+    questions = pack.store.questions(pack_analyst, ACME)
+    runs = pack.store.subagent_runs(pack_analyst, ACME)
+    assert len(questions) == 5
+    assert len(runs) == len(questions)
+    assert {run.state for run in runs} == {"failed"}
+    assert {run.error_category for run in runs} == {"transient"}
+    assert all(run.is_retryable for run in runs)
+    assert set(pack.store.failed_run_question_ids(pack_analyst, ACME)) == {
+        question.id for question in questions
+    }

@@ -287,8 +287,8 @@ class DiscoveryCoordinator:
         `doc_id` against `source_document` happens on the store's side of the boundary and a
         subagent is handed paths it cannot influence.
         """
-        prepared: list[tuple[Question, dict[str, str], str | None]] = []
-        for question in questions:
+        prepared: list[tuple[int, Question, dict[str, str], str | None]] = []
+        for position, question in enumerate(questions, start=1):
             paths: dict[str, str] = {}
             missing: str | None = None
             for doc_id in question.doc_ids:
@@ -299,17 +299,23 @@ class DiscoveryCoordinator:
                     # this question only.
                     missing = "a document this question names is no longer in the source index"
                     break
-            prepared.append((question, paths, missing))
+            prepared.append((position, question, paths, missing))
 
         async def run_one(
-            question: Question, paths: dict[str, str], missing: str | None
+            position: int, question: Question, paths: dict[str, str], missing: str | None
         ) -> _Attempt:
             if missing is not None:
                 return _Attempt(question, None, None, InvalidInput(missing))
             reader = ReadDocumentTool(library, paths, char_budget=self._config.answer_input_cap)
             submit = SubmitAnswerTool()
             agent = SpecialistAgent(
-                self._source.specialist_provider(question.seq),
+                # The position in THIS plan, never `question.seq`. `seq` continues the
+                # engagement's existing numbering, so a second `wb discover` against the same
+                # database starts at 6 and a dropped question shifts every later one: either
+                # would hand a recorded run the wrong recording -- silently, and every subagent
+                # of a second run would fail for want of an entry. The provider for subagent *n*
+                # of this plan is the recording's subagent *n*.
+                self._source.specialist_provider(position),
                 specialist=question.specialist,
                 reader=reader,
                 submit=submit,
@@ -323,13 +329,31 @@ class DiscoveryCoordinator:
                 return _Attempt(question, reader, None, exc)
             return _Attempt(question, reader, result, None, submit.answer)
 
-        gathered = await asyncio.gather(
-            *(run_one(question, paths, missing) for question, paths, missing in prepared),
-            return_exceptions=True,
-        )
+        try:
+            gathered = await asyncio.gather(
+                *(run_one(*entry) for entry in prepared),
+                return_exceptions=True,
+            )
+        except asyncio.CancelledError:
+            # `return_exceptions=True` covers a child failing; it does NOT cover the gather itself
+            # being cancelled, which re-raises here and would otherwise skip the recording loop
+            # below -- leaving persisted questions with no `subagent_run` row at all, which is the
+            # silent disappearance statement 5.3 exists to prevent. Nothing has been recorded at
+            # this point (recording happens after the gather, and `run_one` writes nothing), so
+            # every question of this run becomes a failed row before the cancellation propagates.
+            for _, question, _, _ in prepared:
+                self._record_failure(
+                    principal,
+                    engagement_id,
+                    question,
+                    _Cancelled("the discovery run was cancelled while this subagent was running"),
+                    0,
+                    0,
+                )
+            raise
 
         outcomes: list[SubagentOutcome] = []
-        for (question, _, _), attempt in zip(prepared, gathered, strict=True):
+        for (_, question, _, _), attempt in zip(prepared, gathered, strict=True):
             if isinstance(attempt, BaseException):
                 # `asyncio.gather` returning the exception rather than `run_one` catching it: only
                 # a cancellation of the gather itself reaches here, and it is still a row.
@@ -513,5 +537,13 @@ class _BudgetSpent(WorkbenchError):
     """A subagent's child budget ran out. Transient, and worth a retry with a fresh allowance."""
 
     code = "budget_exhausted"
+    category = ErrorCategory.TRANSIENT
+    retryable = True
+
+
+class _Cancelled(WorkbenchError):
+    """The run was cancelled with its subagents in flight. A row per question, then re-raised."""
+
+    code = "run_cancelled"
     category = ErrorCategory.TRANSIENT
     retryable = True

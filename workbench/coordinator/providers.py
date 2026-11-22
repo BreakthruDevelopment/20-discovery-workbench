@@ -34,7 +34,7 @@ class ProviderSource(Protocol):
     """Where the coordinator gets a provider for the plan, and one per subagent."""
 
     def plan_provider(self) -> ModelProvider: ...
-    def specialist_provider(self, seq: int) -> ModelProvider: ...
+    def specialist_provider(self, position: int) -> ModelProvider: ...
 
 
 class _FailingProvider(ModelProvider):
@@ -71,7 +71,12 @@ class _SpecialistRecording(_Strict):
 
 
 class Recording(_Strict):
-    """The committed fixture: the plan's replies, and one entry per subagent by `seq`."""
+    """The committed fixture: the plan's replies, and one entry per subagent by plan position.
+
+    Keyed by **position in the plan** -- "1" is the first question of whatever plan is being run --
+    never by `question.seq`, which continues an engagement's existing numbering and so differs on
+    a second run of the same engagement.
+    """
 
     plan: list[dict[str, object]] = Field(min_length=1)
     specialists: dict[str, _SpecialistRecording] = Field(default_factory=dict)
@@ -105,8 +110,8 @@ class ReplaySource:
     def plan_provider(self) -> ModelProvider:
         return ReplayProvider(parse_replies({"replies": self._recording.plan}))
 
-    def specialist_provider(self, seq: int) -> ModelProvider:
-        recorded = self._recording.specialists.get(str(seq))
+    def specialist_provider(self, position: int) -> ModelProvider:
+        recorded = self._recording.specialists.get(str(position))
         if recorded is None:
             # A plan with more questions than the recording covers. A stated failure per subagent,
             # which the run then reports as a coverage gap -- not an exception that loses the run.
@@ -129,6 +134,6 @@ class LiveSource:
     def plan_provider(self) -> ModelProvider:
         return self._shared
 
-    def specialist_provider(self, seq: int) -> ModelProvider:
+    def specialist_provider(self, position: int) -> ModelProvider:
         # Deliberately the same object for every subagent: see the module docstring.
         return self._shared
