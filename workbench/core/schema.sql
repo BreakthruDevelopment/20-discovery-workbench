@@ -135,3 +135,8 @@ CREATE TABLE IF NOT EXISTS finalisation (
     accept_gaps   INTEGER NOT NULL CHECK (accept_gaps IN (0, 1)),
     finalised_at  TEXT NOT NULL
 ) STRICT;
+
+-- Stamped so `Store.open` can refuse a database built by a different version of this file, rather
+-- than failing one column at a time as `sqlite3.OperationalError` with no error category. Bump it
+-- here and in `store.SCHEMA_VERSION` together, with any change above.
+PRAGMA user_version = 1;

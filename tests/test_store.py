@@ -11,7 +11,7 @@ from tests.conftest import ACME, ACME_QUOTE, NORTHWIND, Fixture
 from workbench.core.errors import AccessDenied, InvalidInput, NotFound
 from workbench.core.principals import Principal
 from workbench.core.sources import SourceRef
-from workbench.core.store import NewClaim, NewQuestion
+from workbench.core.store import NewClaim, NewQuestion, Store
 
 CLERK = "interviews/ap-clerk.md"
 
@@ -582,3 +582,70 @@ def test_a_nul_byte_in_a_readout_section_is_refused(fixture: Fixture, analyst: P
             roadmap=[],
             coverage={"gaps": [{"reason": "pro\x00blem"}]},
         )
+
+
+def test_a_library_whose_label_and_root_disagree_is_refused(
+    fixture: Fixture, analyst: Principal
+) -> None:
+    """Checking the label alone let a library rooted at the other engagement's tree through, and
+    it then verified a quote against that engagement's file."""
+    from tests.conftest import NORTHWIND_QUOTE
+    from workbench.core.sources import SourceLibrary
+
+    mislabelled = SourceLibrary(
+        fixture.config.engagement_sources_root(NORTHWIND),
+        engagement_id=ACME,
+        max_file_bytes=fixture.config.max_source_file_bytes,
+        max_run_bytes=fixture.config.max_source_run_bytes,
+    )
+    assert mislabelled.verify_quote("ar-notes.md", NORTHWIND_QUOTE) is True
+    with pytest.raises(InvalidInput):
+        fixture.store.index_sources(analyst, ACME, mislabelled)
+    index = _index(fixture, analyst, ACME)
+    question_id = _one_question(fixture, analyst, index[CLERK])
+    with pytest.raises(InvalidInput):
+        fixture.store.record_claims(
+            analyst,
+            ACME,
+            [NewClaim(question_id, "theirs", index[CLERK], NORTHWIND_QUOTE, 0.9)],
+            mislabelled,
+        )
+
+
+def test_an_unserialisable_readout_section_is_refused(fixture: Fixture, analyst: Principal) -> None:
+    """A `datetime` or a `Decimal` is the near miss 20.5 will make; a raw `TypeError` out of the
+    store carries no error category and no field name."""
+    from datetime import date
+
+    with pytest.raises(InvalidInput) as refusal:
+        fixture.store.save_readout(
+            analyst,
+            ACME,
+            maturity=[],
+            outcomes=[],
+            roadmap=[{"phase": "discover", "starts": date(2026, 11, 21)}],
+            coverage={"gaps": []},
+        )
+    assert "readout.roadmap" in str(refusal.value)
+
+
+def test_a_database_from_another_schema_version_is_refused(fixture: Fixture) -> None:
+    """Otherwise a stale scratch database fails one column at a time as
+    `sqlite3.OperationalError`, outside `errors.py` and with no category."""
+    from dataclasses import replace
+
+    from workbench.core.errors import StoreCorrupt
+
+    other = fixture.config.database_path.with_name("other.sqlite3")
+    with Store.open(replace(fixture.config, database_path=other)) as store:
+        store.build()
+        store._connection.execute("PRAGMA user_version = 99")
+    with pytest.raises(StoreCorrupt):
+        Store.open(replace(fixture.config, database_path=other))
+
+
+def test_the_schema_stamp_matches_the_constant(fixture: Fixture) -> None:
+    from workbench.core.store import SCHEMA_VERSION
+
+    stamped = fixture.store._connection.execute("PRAGMA user_version").fetchone()[0]
+    assert int(stamped) == SCHEMA_VERSION

@@ -44,6 +44,7 @@ from workbench.core.principals import (
 )
 from workbench.core.sources import SourceLibrary, SourceRef, SourceText, document_id
 from workbench.core.store import (
+    SCHEMA_VERSION,
     Claim,
     Engagement,
     NewClaim,
@@ -55,6 +56,7 @@ from workbench.core.store import (
 )
 
 __all__ = [
+    "SCHEMA_VERSION",
     "AccessDenied",
     "Action",
     "AlreadyFinal",

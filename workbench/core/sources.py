@@ -24,6 +24,14 @@ What it guarantees, and why each one is here rather than in a caller:
   is not in the document. It cannot be used to read text out, because it returns no text.
 
 Nothing here writes, moves, creates or deletes anything. Every file is opened read-only, as bytes.
+
+**No failure leaves this module untyped.** Every entry point answers with a `WorkbenchError`,
+which is what carries an `error_category` and keeps a caller's batch alive. Two exception families
+have to be caught for that, not one: `OSError` for the ordinary filesystem failures, and
+`RuntimeError` for a **symlink loop** -- `Path.resolve(strict=False)` deliberately converts ELOOP
+into `RuntimeError("Symlink loop from <absolute path>")` rather than an `OSError`, so catching
+`OSError` alone leaves exactly the hole it was meant to close, absolute path in the message and
+all. This repo pins Python >=3.12,<3.13, where that is the shipped behaviour.
 """
 
 from __future__ import annotations
@@ -35,6 +43,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
+from workbench.core.config import Config
 from workbench.core.errors import (
     InvalidInput,
     SourceOutsideRoot,
@@ -142,13 +151,34 @@ class SourceLibrary:
         self._max_file_bytes = max_file_bytes
         self._max_run_bytes = max_run_bytes
         self._bytes_served = 0
-        # `strict=False`: a missing tree is an empty library, not a crash. The second engagement in
-        # the seed has no committed pack, and an empty index is the honest answer for it.
-        self._root = root.resolve()
+        # `strict=False` (the default): a missing tree is an empty library, not a crash. The
+        # second engagement in the seed has no committed pack, and an empty index is the honest
+        # answer for it. `RuntimeError` as well as `OSError`: see the module docstring on ELOOP.
+        try:
+            self._root = root.resolve()
+        except (OSError, RuntimeError) as exc:
+            raise SourceUnreadable("the engagement's source root could not be resolved") from exc
 
     @property
     def root(self) -> Path:
         return self._root
+
+    @classmethod
+    def for_engagement(cls, config: Config, engagement_id: str) -> SourceLibrary:
+        """The sanctioned constructor: root and label both derived from one config.
+
+        Built by hand, the two can disagree -- `SourceLibrary(northwind_root,
+        engagement_id="acme-p2p")` satisfied the store's label check and then verified a quote
+        against the other engagement's file. `store.index_sources` and `store.record_claims` now
+        check the resolved root as well as the label, and this is how a caller gets one that
+        passes.
+        """
+        return cls(
+            config.engagement_sources_root(engagement_id),
+            engagement_id=engagement_id,
+            max_file_bytes=config.max_source_file_bytes,
+            max_run_bytes=config.max_source_run_bytes,
+        )
 
     @property
     def engagement_id(self) -> str:
@@ -188,7 +218,14 @@ class SourceLibrary:
         candidate = Path(relative_path)
         if candidate.is_absolute():
             raise SourceOutsideRoot("a document path is relative to the engagement's source root")
-        resolved = (self._root / candidate).resolve()
+        try:
+            resolved = (self._root / candidate).resolve()
+        except (OSError, RuntimeError) as exc:
+            # A symlink loop arrives here as `RuntimeError`, carrying the absolute path in its
+            # message; everything else as `OSError`. Both become one refusal that names neither.
+            raise SourceUnreadable(
+                "a document path under the source root could not be resolved"
+            ) from exc
         # `is_relative_to` on the resolved pair is the whole check: `..` segments are gone and any
         # symlink has been followed, so a link out of the tree lands outside the root here. The
         # root itself satisfies it and is then refused by the suffix check below, as a directory.
@@ -216,18 +253,21 @@ class SourceLibrary:
             if not self._root.is_dir():
                 return
             candidates = sorted(self._root.rglob("*"))
-        except OSError:
+        except (OSError, RuntimeError):
             # The root itself is unreadable. An empty index, not a traceback.
             return
         for path in candidates:
             try:
                 if not path.is_file():
                     continue
-            except OSError:
+            except (OSError, RuntimeError):
                 continue
             if not _servable_name(path):
                 continue
-            resolved = path.resolve()
+            try:
+                resolved = path.resolve()
+            except (OSError, RuntimeError):
+                continue
             if not resolved.is_relative_to(self._root):
                 # A symlink inside the tree pointing out of it. Left out of the index entirely:
                 # it is not this engagement's evidence, so it is not listed as unreadable either.
@@ -302,7 +342,7 @@ class SourceLibrary:
             if not resolved.is_file():
                 raise SourceUnreadable("no such document in the engagement's source root")
             return requested, resolved.read_bytes()
-        except OSError as exc:
+        except (OSError, RuntimeError) as exc:
             raise SourceUnreadable("a document under the source root could not be read") from exc
 
     def read(self, relative_path: str) -> SourceText:

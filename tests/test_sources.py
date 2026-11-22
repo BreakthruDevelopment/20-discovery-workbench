@@ -450,3 +450,47 @@ def test_an_os_error_on_a_read_becomes_a_workbench_error(
     assert ref.readable is False
     assert ref.unread_reason is not None
     assert str(root) not in ref.unread_reason
+
+
+# ---- regressions from the third review round ------------------------------------------------
+
+
+def test_a_symlink_loop_is_a_workbench_error_not_a_runtime_error(tmp_path: Path) -> None:
+    """`Path.resolve(strict=False)` converts ELOOP to `RuntimeError`, not `OSError`, so catching
+    `OSError` alone left the whole hole open: a raw escape, the absolute path in the message, and
+    a lost batch of claims (`_quote_checks_out` catches only `WorkbenchError`)."""
+    root = tmp_path / "pack"
+    root.mkdir()
+    (root / "loop.md").symlink_to(root / "loop.md")
+    library = _library(root)
+    for call in (
+        lambda: library.read("loop.md"),
+        lambda: library.verify_quote("loop.md", "a quote long enough to pass the floor"),
+    ):
+        with pytest.raises(SourceUnreadable) as refusal:
+            call()
+        assert str(root) not in str(refusal.value)
+        assert "loop.md" not in str(refusal.value)
+
+
+def test_a_symlink_loop_does_not_break_the_index(tmp_path: Path) -> None:
+    root = tmp_path / "pack"
+    root.mkdir()
+    (root / "loop.md").symlink_to(root / "loop.md")
+    (root / "real.md").write_text("evidence\n", encoding="utf-8")
+    assert [ref.path for ref in _library(root).list_documents()] == ["real.md"]
+
+
+def test_a_looping_root_is_a_workbench_error(tmp_path: Path) -> None:
+    looping = tmp_path / "looping"
+    looping.symlink_to(looping)
+    with pytest.raises(SourceUnreadable):
+        SourceLibrary(looping, engagement_id=ACME, max_file_bytes=100, max_run_bytes=100)
+
+
+def test_the_factory_derives_the_root_and_the_label_together(fixture: Fixture) -> None:
+    from workbench.core.sources import SourceLibrary as Library
+
+    library = Library.for_engagement(fixture.config, ACME)
+    assert library.engagement_id == ACME
+    assert library.root == fixture.config.engagement_sources_root(ACME).resolve()

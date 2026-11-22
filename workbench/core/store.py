@@ -57,6 +57,11 @@ _SEED_PATH = Path(__file__).with_name("seed.sql")
 #: The closed set of specialists a question may name (spec, `discovery-plan` output schema).
 SPECIALISTS = frozenset({"process", "systems", "data", "change"})
 
+#: Stamped into `PRAGMA user_version` by `schema.sql` and checked by `Store.open`, so a database
+#: from a different schema becomes one stated refusal instead of a column-by-column
+#: `sqlite3.OperationalError` with no error category. Bump it with any change to `schema.sql`.
+SCHEMA_VERSION = 1
+
 #: Readout states. `draft` until a lead finalises.
 READOUT_DRAFT = "draft"
 READOUT_FINAL = "final"
@@ -77,7 +82,12 @@ MAX_SECTION_CHARS = 20_000
 
 def _json_section(value: object, *, field: str) -> str:
     """One readout section, serialised, NUL-free and length-capped, or `InvalidInput`."""
-    encoded = json.dumps(value)
+    try:
+        encoded = json.dumps(value)
+    except (TypeError, ValueError) as exc:
+        # A `datetime` or a `Decimal` in a readout section is the near miss 20.5 will make. A raw
+        # `TypeError` out of the store has no error category and no field name in it.
+        raise InvalidInput(f"{field} is not JSON-serialisable") from exc
     # `json.dumps` escapes a NUL to the six characters `\u0000`, so the raw check alone never
     # fires; both forms are rejected, since a caller may also hand over pre-escaped text.
     if "\x00" in encoded or "\\u0000" in encoded:
@@ -190,11 +200,13 @@ class Store:
     def __init__(
         self,
         connection: sqlite3.Connection,
+        config: Config,
         *,
         now: Callable[[], datetime] = lambda: datetime.now(UTC),
         new_id: Callable[[], str] = lambda: uuid.uuid4().hex,
     ) -> None:
         self._connection = connection
+        self._config = config
         self._now = now
         self._new_id = new_id
 
@@ -222,7 +234,16 @@ class Store:
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA journal_mode = WAL")
         connection.execute("PRAGMA busy_timeout = 5000")
-        return cls(connection, now=now, new_id=new_id)
+        version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+        if version not in (0, SCHEMA_VERSION):
+            # 0 is "no schema applied yet", which `create_schema` then stamps. Any other value is
+            # a database built by a different version of `schema.sql`, and continuing would mean
+            # queries failing one column at a time as `sqlite3.OperationalError` -- outside
+            # `errors.py`, with no category. This repo ships no migration tool, so the answer is a
+            # stated refusal; the demo and the smoke build in a fresh `mkdtemp()` anyway.
+            connection.close()
+            raise StoreCorrupt("this database was built by a different schema version")
+        return cls(connection, config, now=now, new_id=new_id)
 
     def close(self) -> None:
         self._connection.close()
@@ -379,11 +400,10 @@ class Store:
         half-updated index can never be followed.
         """
         self._authorise(principal, Action.LIST_SOURCES, engagement_id)
-        if library.engagement_id != engagement_id:
-            # The last piece of the owner filter that could otherwise sit in a caller: with the
-            # wrong library, this would write another engagement's documents into this index and
-            # `document_path` would hand them straight back.
-            raise InvalidInput("the source library is rooted at a different engagement")
+        # The last piece of the owner filter that could otherwise sit in a caller: with the wrong
+        # library, this would write another engagement's documents into this index and
+        # `document_path` would hand them straight back.
+        self._assert_library(library, engagement_id)
         refs = tuple(library.list_documents())
         try:
             with self._transaction() as connection:
@@ -434,6 +454,12 @@ class Store:
             raise StoreCorrupt(
                 "the recorded source index cannot be reconciled with this engagement's tree"
             ) from exc
+        except sqlite3.OperationalError as exc:
+            # A database whose `source_document` predates this schema: `create_schema` is
+            # `IF NOT EXISTS`, so it adds no column to an existing table. `Store.open`'s version
+            # check catches this for anything stamped; this catches a database stamped 0 by a
+            # build that had no stamp.
+            raise StoreCorrupt("the recorded source index does not match this schema") from exc
         return refs
 
     def source_documents(self, principal: Principal, engagement_id: str) -> tuple[SourceRef, ...]:
@@ -687,8 +713,7 @@ class Store:
         cap is what bounds how many claims reach a prompt.
         """
         self._authorise(principal, Action.RUN_DISCOVERY, engagement_id)
-        if library.engagement_id != engagement_id:
-            raise InvalidInput("the source library is rooted at a different engagement")
+        self._assert_library(library, engagement_id)
         incoming = list(claims)
         recorded: list[Claim] = []
         with self._transaction() as connection:
@@ -919,6 +944,23 @@ class Store:
         return bool(row["accept_gaps"])
 
     # ---- helpers --------------------------------------------------------------------------
+
+    def _assert_library(self, library: SourceLibrary, engagement_id: str) -> None:
+        """Refuse a library that is not this engagement's, by label **and** by resolved root.
+
+        The label alone was not enough: `SourceLibrary(northwind_root,
+        engagement_id="acme-p2p")` satisfied it and then verified a quote against the other
+        engagement's file. The root is the fact; the label is a claim about it.
+        """
+        if library.engagement_id != engagement_id:
+            raise InvalidInput("the source library is rooted at a different engagement")
+        expected = self._config.engagement_sources_root(engagement_id)
+        try:
+            resolved = expected.resolve()
+        except (OSError, RuntimeError) as exc:
+            raise StoreCorrupt("the configured source root could not be resolved") from exc
+        if library.root != resolved:
+            raise InvalidInput("the source library is rooted outside this engagement's source root")
 
     @staticmethod
     def _question_doc_ids(connection: sqlite3.Connection, question_id: str) -> frozenset[str]:

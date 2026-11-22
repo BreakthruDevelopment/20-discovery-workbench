@@ -124,6 +124,9 @@ _NOTHING_TO_LEAK = {
     "Store.finalisation_accepted_gaps",
     "Store.index_sources",
     "SourceLibrary.list_documents",
+    # Derives a root and a label from a config; the only refusal is the constructor's blank-label
+    # check, which names no caller value.
+    "SourceLibrary.for_engagement",
 }
 
 #: Which member each sweep case exercises. The sweep is hand-written -- a generic fuzzer cannot

@@ -68,12 +68,8 @@ def _write_tree(root: Path) -> None:
 
 
 def _library_for(config: Config, engagement_id: str) -> SourceLibrary:
-    return SourceLibrary(
-        config.engagement_sources_root(engagement_id),
-        engagement_id=engagement_id,
-        max_file_bytes=config.max_source_file_bytes,
-        max_run_bytes=config.max_source_run_bytes,
-    )
+    """Via the sanctioned factory, so the fixtures exercise the path callers are meant to use."""
+    return SourceLibrary.for_engagement(config, engagement_id)
 
 
 @pytest.fixture
