@@ -69,6 +69,23 @@ READOUT_FINAL = "final"
 MAX_TEXT_CHARS = 2_000
 MAX_RATIONALE_CHARS = 1_000
 
+#: Cap per readout JSON section, on the serialised text. `save_readout` is the one boundary whose
+#: input is a structure rather than a string, and a boundary without a bound is not one: a
+#: 500,000-character `maturity` was accepted, and these sections are what `wb readout` renders.
+MAX_SECTION_CHARS = 20_000
+
+
+def _json_section(value: object, *, field: str) -> str:
+    """One readout section, serialised, NUL-free and length-capped, or `InvalidInput`."""
+    encoded = json.dumps(value)
+    # `json.dumps` escapes a NUL to the six characters `\u0000`, so the raw check alone never
+    # fires; both forms are rejected, since a caller may also hand over pre-escaped text.
+    if "\x00" in encoded or "\\u0000" in encoded:
+        raise InvalidInput(f"{field} contains no NUL byte")
+    if len(encoded) > MAX_SECTION_CHARS:
+        raise InvalidInput(f"{field} is at most {MAX_SECTION_CHARS} characters when serialised")
+    return encoded
+
 
 def _text(value: str, *, field: str, limit: int) -> str:
     """A free-text field, trimmed, length-capped and NUL-free, or `InvalidInput`.
@@ -354,9 +371,12 @@ class Store:
 
         A row whose document has disappeared from the tree is deleted **only if no claim cites
         it**. One that is cited stays, because `wb trace` has to resolve the document a claim
-        names, and the recorded path and digest are the record of what that document was; reading
-        it then fails as `source_unreadable`, which is the honest answer. All in one transaction,
-        so a half-updated index can never be followed.
+        names; reading it then fails as `source_unreadable`, which is the honest answer. Note the
+        limit of that: the row records what the document is *now*, because the upsert overwrites
+        `sha256` for a document that changed in place -- so it is a record of what a claim pointed
+        at only for a document that left the tree. 20.5 re-verifies every quote before synthesis,
+        which is where a changed document is actually caught. All in one transaction, so a
+        half-updated index can never be followed.
         """
         self._authorise(principal, Action.LIST_SOURCES, engagement_id)
         if library.engagement_id != engagement_id:
@@ -365,38 +385,68 @@ class Store:
             # `document_path` would hand them straight back.
             raise InvalidInput("the source library is rooted at a different engagement")
         refs = tuple(library.list_documents())
-        with self._transaction() as connection:
-            connection.executemany(
-                "INSERT INTO source_document (id, engagement_id, path, sha256, bytes) "
-                "VALUES (?, ?, ?, ?, ?) "
-                "ON CONFLICT(id) DO UPDATE SET path = excluded.path, "
-                "sha256 = excluded.sha256, bytes = excluded.bytes",
-                [(ref.doc_id, engagement_id, ref.path, ref.sha256, ref.bytes) for ref in refs],
-            )
-            current = {ref.doc_id for ref in refs}
-            recorded = {
-                str(row["id"])
-                for row in connection.execute(
-                    "SELECT id FROM source_document WHERE engagement_id = ?", (engagement_id,)
-                ).fetchall()
-            }
-            # One fully parameterised statement per stale id, rather than a generated `IN (...)`
-            # list: no SQL text is ever built from data, there is no `IN ()` empty-list special
-            # case, and an index is dozens of files. The `NOT IN (SELECT doc_id ...)` is what
-            # keeps a row a claim still cites.
-            for doc_id in sorted(recorded - current):
-                connection.execute(
-                    "DELETE FROM source_document WHERE engagement_id = ? AND id = ? "
-                    "AND id NOT IN (SELECT doc_id FROM claim WHERE engagement_id = ?)",
-                    (engagement_id, doc_id, engagement_id),
+        try:
+            with self._transaction() as connection:
+                connection.executemany(
+                    "INSERT INTO source_document "
+                    "(id, engagement_id, path, sha256, bytes, readable, unread_reason) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(id) DO UPDATE SET path = excluded.path, "
+                    "sha256 = excluded.sha256, bytes = excluded.bytes, "
+                    "readable = excluded.readable, unread_reason = excluded.unread_reason",
+                    [
+                        (
+                            ref.doc_id,
+                            engagement_id,
+                            ref.path,
+                            ref.sha256,
+                            ref.bytes,
+                            1 if ref.readable else 0,
+                            ref.unread_reason,
+                        )
+                        for ref in refs
+                    ],
                 )
+                current = {ref.doc_id for ref in refs}
+                recorded = {
+                    str(row["id"])
+                    for row in connection.execute(
+                        "SELECT id FROM source_document WHERE engagement_id = ?",
+                        (engagement_id,),
+                    ).fetchall()
+                }
+                # One fully parameterised statement per stale id, rather than a generated
+                # `IN (...)` list: no SQL text is ever built from data, there is no `IN ()`
+                # empty-list special case, and an index is dozens of files. The
+                # `NOT IN (SELECT doc_id ...)` is what keeps a row a claim still cites.
+                for doc_id in sorted(recorded - current):
+                    connection.execute(
+                        "DELETE FROM source_document WHERE engagement_id = ? AND id = ? "
+                        "AND id NOT IN (SELECT doc_id FROM claim WHERE engagement_id = ?)",
+                        (engagement_id, doc_id, engagement_id),
+                    )
+        except sqlite3.IntegrityError as exc:
+            # The one integrity route left here: a row kept because a claim cites it, whose `path`
+            # now collides with an incoming row under `UNIQUE (engagement_id, path)`. Reachable
+            # only across a change to the id format with a claim already recorded -- a scratch
+            # database from an older build -- but mapped rather than left raw, because every other
+            # failure in this module carries an `error_category` and this one would not.
+            raise StoreCorrupt(
+                "the recorded source index cannot be reconciled with this engagement's tree"
+            ) from exc
         return refs
 
     def source_documents(self, principal: Principal, engagement_id: str) -> tuple[SourceRef, ...]:
-        """The recorded source index for one engagement, sorted by path."""
+        """The recorded source index for one engagement, sorted by path.
+
+        Readability comes from the stored columns, not from an assumption. The first version
+        returned `readable=True` and no reason for every row, so `wb sources list` -- whose job
+        the spec states as "the source index, with sizes **and what is unreadable**" -- would have
+        reported an undecodable document as fine, with nothing in 20.6 to reveal it.
+        """
         self._authorise(principal, Action.LIST_SOURCES, engagement_id)
         rows = self._connection.execute(
-            "SELECT id, path, sha256, bytes FROM source_document "
+            "SELECT id, path, sha256, bytes, readable, unread_reason FROM source_document "
             "WHERE engagement_id = ? ORDER BY path",
             (engagement_id,),
         ).fetchall()
@@ -406,7 +456,8 @@ class Store:
                 path=str(row["path"]),
                 bytes=int(row["bytes"]),
                 sha256=str(row["sha256"]),
-                readable=True,
+                readable=bool(row["readable"]),
+                unread_reason=(None if row["unread_reason"] is None else str(row["unread_reason"])),
             )
             for row in rows
         )
@@ -629,6 +680,11 @@ class Store:
         citing a document that question never named did not come from what the subagent was shown.
         Checking only "is it in this engagement" would let one subagent's answer reach across to
         another's evidence, which is the same leak as crossing engagements, one level down.
+
+        `claim.text` and `claim.quote` are each capped at `MAX_TEXT_CHARS`, so one claim can be
+        twice that. Deliberate -- a quote must be able to be long enough to be worth verifying --
+        and it means the caps bound a claim at 4,000 characters, not 2,000; 20.5's own synthesis
+        cap is what bounds how many claims reach a prompt.
         """
         self._authorise(principal, Action.RUN_DISCOVERY, engagement_id)
         if library.engagement_id != engagement_id:
@@ -787,11 +843,11 @@ class Store:
                 "UPDATE readout SET maturity_json = ?, outcomes_json = ?, roi_json = ?, "
                 "roadmap_json = ?, coverage_json = ? WHERE engagement_id = ?",
                 (
-                    json.dumps(maturity),
-                    json.dumps(outcomes),
-                    None if roi is None else json.dumps(roi),
-                    json.dumps(roadmap),
-                    json.dumps(coverage),
+                    _json_section(maturity, field="readout.maturity"),
+                    _json_section(outcomes, field="readout.outcomes"),
+                    None if roi is None else _json_section(roi, field="readout.roi"),
+                    _json_section(roadmap, field="readout.roadmap"),
+                    _json_section(coverage, field="readout.coverage"),
                     engagement_id,
                 ),
             )

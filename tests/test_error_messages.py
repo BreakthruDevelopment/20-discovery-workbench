@@ -163,17 +163,19 @@ def test_no_refusal_echoes_its_input(fixture: Fixture, analyst: Principal) -> No
 
 
 def test_every_member_that_takes_input_is_swept() -> None:
-    """The guard that makes the sweep's coverage automatic."""
-    import inspect
+    """The guard that makes the sweep's coverage automatic.
 
+    Shares `_public_callables` with the sponsor sweep so both see classmethods: built on
+    `inspect.isfunction`, both missed a deliberately leaky classmethod without a failure.
+    """
+    from tests.test_sponsor_surface import _public_callables
     from workbench.core.sources import SourceLibrary as Library
     from workbench.core.store import Store
 
     members = {
         f"{owner.__name__}.{name}"
         for owner in (Store, Library)
-        for name, member in inspect.getmembers(owner, callable)
-        if not name.startswith("_") and inspect.isfunction(member)
+        for name in _public_callables(owner)
     }
     uncovered = members - set(_COVERED.values()) - _NOTHING_TO_LEAK
     assert not uncovered, (

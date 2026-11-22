@@ -29,10 +29,11 @@ Nothing here writes, moves, creates or deletes anything. Every file is opened re
 from __future__ import annotations
 
 import hashlib
+import os
 import unicodedata
 from collections.abc import Iterator
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from workbench.core.errors import (
     InvalidInput,
@@ -167,8 +168,19 @@ class SourceLibrary:
     def run_bytes_remaining(self) -> int:
         return max(0, self._max_run_bytes - self._bytes_served)
 
-    def _resolve(self, relative_path: str) -> Path:
-        """The absolute path for `relative_path`, or a refusal. The one gate on the filesystem."""
+    def _resolve(self, relative_path: str) -> tuple[Path, str]:
+        """`(absolute path, the requested relative path)`, or a refusal.
+
+        The one gate on the filesystem, and the only place a caller's path becomes a real one.
+
+        It returns **both** because they can differ and each is needed for a different job. The
+        resolved path is the security answer: `..` is gone, symlinks are followed, and a path that
+        lands outside the root is refused. The requested path, merely normalised, is the *index*
+        answer: `source_document` is keyed on the path as listed, so for an in-root
+        `alias.md -> notes.md` a read of `alias.md` must report `alias.md`'s document id. Reporting
+        the target's id instead made `read()` and `list_documents()` disagree, and a claim built
+        from a subagent's own read was then refused by `record_claims`' per-question check.
+        """
         if not relative_path or relative_path.strip() != relative_path:
             raise InvalidInput("a document path is required and carries no surrounding whitespace")
         if "\x00" in relative_path:
@@ -182,18 +194,36 @@ class SourceLibrary:
         # root itself satisfies it and is then refused by the suffix check below, as a directory.
         if not resolved.is_relative_to(self._root):
             raise SourceOutsideRoot("a document path resolves outside the engagement's source root")
-        if resolved.stem.lower() in REFUSED_STEMS:
-            raise SourceRefused("the source library does not serve the pack manifest")
-        if resolved.suffix.lower() not in ALLOWED_SUFFIXES:
-            raise SourceRefused("the source library serves only text documents")
-        return resolved
+        # Lexical normalisation only, for the index key. `resolve()` above is the security answer;
+        # this cannot be, because it does not follow links -- which is exactly why it is the right
+        # key for a path that WAS a link.
+        requested = PurePosixPath(os.path.normpath(candidate.as_posix())).as_posix()
+        if requested == ".." or requested.startswith("../"):
+            raise SourceOutsideRoot("a document path resolves outside the engagement's source root")
+        # Both names are screened: the one asked for and the one it lands on. Either alone leaves a
+        # hole -- `notes.md -> manifest.json` passes the first, and a served name is no excuse for
+        # a refused target.
+        for name in (PurePosixPath(requested), resolved):
+            if Path(name).stem.lower() in REFUSED_STEMS:
+                raise SourceRefused("the source library does not serve the pack manifest")
+            if Path(name).suffix.lower() not in ALLOWED_SUFFIXES:
+                raise SourceRefused("the source library serves only text documents")
+        return resolved, requested
 
     def _entries(self) -> Iterator[Path]:
         """Every servable file under the root, sorted, with refused paths already dropped."""
-        if not self._root.is_dir():
+        try:
+            if not self._root.is_dir():
+                return
+            candidates = sorted(self._root.rglob("*"))
+        except OSError:
+            # The root itself is unreadable. An empty index, not a traceback.
             return
-        for path in sorted(self._root.rglob("*")):
-            if not path.is_file():
+        for path in candidates:
+            try:
+                if not path.is_file():
+                    continue
+            except OSError:
                 continue
             if not _servable_name(path):
                 continue
@@ -219,10 +249,28 @@ class SourceLibrary:
         refs: list[SourceRef] = []
         for path in self._entries():
             relative = path.relative_to(self._root).as_posix()
-            raw = path.read_bytes()
-            digest = hashlib.sha256(raw).hexdigest()
             readable = True
             reason: str | None = None
+            try:
+                raw = path.read_bytes()
+            except OSError:
+                # A file inside the root the process cannot read: mode 000, a dangling link, a
+                # device, a race with something rewriting the tree. Listed as unreadable rather
+                # than escaping as a raw `OSError` -- which is what `wb sources list` and
+                # `wb discover` would have died on, at step one, as a traceback. The reason names
+                # no path and no errno string: both carry the absolute filesystem path.
+                refs.append(
+                    SourceRef(
+                        doc_id=document_id(self._engagement_id, relative),
+                        path=relative,
+                        bytes=0,
+                        sha256="",
+                        readable=False,
+                        unread_reason="the file could not be read from disk",
+                    )
+                )
+                continue
+            digest = hashlib.sha256(raw).hexdigest()
             try:
                 raw.decode("utf-8")
             except UnicodeDecodeError:
@@ -240,11 +288,22 @@ class SourceLibrary:
             )
         return refs
 
-    def _read_bytes(self, relative_path: str) -> tuple[Path, bytes]:
-        resolved = self._resolve(relative_path)
-        if not resolved.is_file():
-            raise SourceUnreadable("no such document in the engagement's source root")
-        return resolved, resolved.read_bytes()
+    def _read_bytes(self, relative_path: str) -> tuple[str, bytes]:
+        """`(the requested relative path, its bytes)`, or a `SourceUnreadable`.
+
+        Every `OSError` is mapped here. A raw one escaping this module reaches the CLI as a
+        traceback, carries the absolute filesystem path in its message -- which `errors.py` states
+        and tests that refusals never do -- and sails past `_quote_checks_out` in `store.py`, which
+        catches `WorkbenchError`, so one unreadable document would roll back a whole batch of
+        claims instead of leaving that one `verified: false`.
+        """
+        resolved, requested = self._resolve(relative_path)
+        try:
+            if not resolved.is_file():
+                raise SourceUnreadable("no such document in the engagement's source root")
+            return requested, resolved.read_bytes()
+        except OSError as exc:
+            raise SourceUnreadable("a document under the source root could not be read") from exc
 
     def read(self, relative_path: str) -> SourceText:
         """Serve one document as text, trimmed to the caps, with the trim stated.
@@ -252,8 +311,7 @@ class SourceLibrary:
         The per-run cap is spent by what is actually served, so a trimmed read spends only the
         bytes it handed back.
         """
-        resolved, raw = self._read_bytes(relative_path)
-        relative = resolved.relative_to(self._root).as_posix()
+        relative, raw = self._read_bytes(relative_path)
         doc_id = document_id(self._engagement_id, relative)
         total = len(raw)
 

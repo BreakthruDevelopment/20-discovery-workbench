@@ -38,7 +38,17 @@ CREATE TABLE IF NOT EXISTS source_document (
     engagement_id TEXT NOT NULL REFERENCES engagement (id),
     path          TEXT NOT NULL,
     sha256        TEXT NOT NULL,
-    bytes         INTEGER NOT NULL CHECK (bytes >= 0)
+    bytes         INTEGER NOT NULL CHECK (bytes >= 0),
+    -- Readability is PERSISTED, not re-derived. `wb sources list` is "the source index, with sizes
+    -- and what is unreadable", and it is a read command: it must not open every file again to find
+    -- out, and it must not quietly report everything readable because the column was missing. An
+    -- unreadable document always carries its reason and never the other way round, so the two
+    -- columns cannot drift apart. A file that could not be read at all has no digest, which is the
+    -- only case an empty sha256 is allowed.
+    readable      INTEGER NOT NULL CHECK (readable IN (0, 1)),
+    unread_reason TEXT,
+    CHECK ((readable = 0) = (unread_reason IS NOT NULL)),
+    CHECK (readable = 0 OR length(sha256) = 64)
 ) STRICT;
 
 CREATE UNIQUE INDEX IF NOT EXISTS source_document_engagement_path

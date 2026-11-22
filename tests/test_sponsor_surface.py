@@ -14,7 +14,7 @@ appears in `_ALLOWED_FOR_SPONSOR` by someone's decision, or the sweep fails.
 
 from __future__ import annotations
 
-import inspect
+import types
 from typing import Any
 
 import pytest
@@ -41,13 +41,26 @@ _SPONSOR_MAY = {
 _NOT_ACCESSORS = {"open", "close", "create_schema", "seed", "build", "load_principal"}
 
 
-def _public_accessors() -> list[str]:
-    """Every public `Store` method that takes an acting principal."""
-    return sorted(
+def _public_callables(owner: type) -> set[str]:
+    """Every public callable the class itself defines, **classmethods and staticmethods included**.
+
+    `inspect.isfunction` is `False` for a `classmethod`, so a sweep built on it skips them
+    silently -- verified: a deliberately leaky classmethod added to `Store` escaped both this
+    sweep and the error-message sweep without a failure. `Store.open` is itself a classmethod that
+    opens a database, so the gap is not hypothetical. `vars()` reads the class's own `__dict__`,
+    where a classmethod is still a `classmethod` object rather than a bound method.
+    """
+    return {
         name
-        for name, member in inspect.getmembers(Store, callable)
-        if not name.startswith("_") and inspect.isfunction(member) and name not in _NOT_ACCESSORS
-    )
+        for name, raw in vars(owner).items()
+        if not name.startswith("_")
+        and isinstance(raw, types.FunctionType | classmethod | staticmethod)
+    }
+
+
+def _public_accessors() -> list[str]:
+    """Every public `Store` member that takes an acting principal."""
+    return sorted(_public_callables(Store) - _NOT_ACCESSORS)
 
 
 def _sponsor_call(fixture: Fixture, sponsor: Principal, name: str, context: dict[str, Any]) -> None:

@@ -10,14 +10,20 @@ from agent_container.core.tool import ErrorCategory
 from tests.conftest import ACME, ACME_QUOTE, NORTHWIND, Fixture
 from workbench.core.errors import AccessDenied, InvalidInput, NotFound
 from workbench.core.principals import Principal
+from workbench.core.sources import SourceRef
 from workbench.core.store import NewClaim, NewQuestion
 
 CLERK = "interviews/ap-clerk.md"
 
 
+def _index_refs(
+    fixture: Fixture, principal: Principal, engagement_id: str
+) -> tuple[SourceRef, ...]:
+    return fixture.store.index_sources(principal, engagement_id, fixture.library(engagement_id))
+
+
 def _index(fixture: Fixture, principal: Principal, engagement_id: str) -> dict[str, str]:
-    refs = fixture.store.index_sources(principal, engagement_id, fixture.library(engagement_id))
-    return {ref.path: ref.doc_id for ref in refs}
+    return {ref.path: ref.doc_id for ref in _index_refs(fixture, principal, engagement_id)}
 
 
 def _one_question(fixture: Fixture, analyst: Principal, doc_id: str) -> str:
@@ -535,3 +541,44 @@ def test_free_text_is_trimmed(fixture: Fixture, analyst: Principal) -> None:
         analyst, ACME, [NewQuestion("  padded  ", "process", [index[CLERK]], "  why  ")]
     )
     assert (question.text, question.rationale) == ("padded", "why")
+
+
+def test_the_recorded_index_reports_what_is_unreadable(
+    fixture: Fixture, analyst: Principal
+) -> None:
+    """`source_documents` returned `readable=True` for every row, so `wb sources list` -- "the
+    source index, with sizes and what is unreadable" -- would have called an undecodable document
+    fine, and 20.6 would have had nothing to reveal it."""
+    (fixture.config.engagement_sources_root(ACME) / "broken.txt").write_bytes(b"\xff\xfe nope")
+    live = {ref.path: ref for ref in _index_refs(fixture, analyst, ACME)}
+    assert live["broken.txt"].readable is False
+    recorded = {ref.path: ref for ref in fixture.store.source_documents(analyst, ACME)}
+    assert recorded["broken.txt"].readable is False
+    assert recorded["broken.txt"].unread_reason == live["broken.txt"].unread_reason
+    assert recorded[CLERK].readable is True
+    assert recorded[CLERK].unread_reason is None
+
+
+def test_a_readout_section_is_length_capped(fixture: Fixture, analyst: Principal) -> None:
+    """`save_readout` was the one boundary with no bound at all."""
+    with pytest.raises(InvalidInput):
+        fixture.store.save_readout(
+            analyst,
+            ACME,
+            maturity=["x" * 500_000],
+            outcomes=[],
+            roadmap=[],
+            coverage={"gaps": []},
+        )
+
+
+def test_a_nul_byte_in_a_readout_section_is_refused(fixture: Fixture, analyst: Principal) -> None:
+    with pytest.raises(InvalidInput):
+        fixture.store.save_readout(
+            analyst,
+            ACME,
+            maturity=[],
+            outcomes=[],
+            roadmap=[],
+            coverage={"gaps": [{"reason": "pro\x00blem"}]},
+        )

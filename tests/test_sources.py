@@ -329,3 +329,124 @@ def test_a_symlinked_directory_component_out_of_the_root_is_refused(tmp_path: Pa
     with pytest.raises(SourceOutsideRoot):
         library.read("linked/notes.md")
     assert library.list_documents() == []
+
+
+# ---- regressions from the second review round -----------------------------------------------
+
+
+def _make_unreadable(path: Path) -> bool:
+    """Make `path` unreadable to this process, or report that it cannot be done here."""
+    import os
+
+    path.chmod(0o000)
+    return not os.access(path, os.R_OK)
+
+
+def test_an_unreadable_file_is_listed_not_raised(tmp_path: Path) -> None:
+    """A raw `OSError` out of `list_documents` killed `wb sources list` and `wb discover` at step
+    one, as a traceback, and its message carries the absolute filesystem path."""
+    root = tmp_path / "pack"
+    root.mkdir()
+    (root / "locked.md").write_text("evidence nobody can read\n", encoding="utf-8")
+    (root / "fine.md").write_text("evidence anyone can read\n", encoding="utf-8")
+    if not _make_unreadable(root / "locked.md"):
+        pytest.skip("this process can read a mode-000 file (running as root)")
+    refs = {ref.path: ref for ref in _library(root).list_documents()}
+    assert refs["locked.md"].readable is False
+    assert refs["locked.md"].unread_reason is not None
+    assert refs["fine.md"].readable is True
+
+
+def test_reading_an_unreadable_file_raises_a_workbench_error(tmp_path: Path) -> None:
+    root = tmp_path / "pack"
+    root.mkdir()
+    secret = root / "locked.md"
+    secret.write_text("evidence nobody can read\n", encoding="utf-8")
+    if not _make_unreadable(secret):
+        pytest.skip("this process can read a mode-000 file (running as root)")
+    library = _library(root)
+    for call in (
+        lambda: library.read("locked.md"),
+        lambda: library.verify_quote("locked.md", "x" * 20),
+    ):
+        with pytest.raises(SourceUnreadable) as refusal:
+            call()
+        assert refusal.value.category.value == "business"
+        # The message must not carry the absolute path: errors.py states refusals never do.
+        assert str(root) not in str(refusal.value)
+
+
+def test_an_unreadable_root_is_an_empty_index(tmp_path: Path) -> None:
+    root = tmp_path / "pack"
+    root.mkdir()
+    (root / "fine.md").write_text("evidence\n", encoding="utf-8")
+    root.chmod(0o000)
+    try:
+        import os
+
+        if os.access(root, os.R_OK):
+            pytest.skip("this process can read a mode-000 directory (running as root)")
+        assert _library(root).list_documents() == []
+    finally:
+        root.chmod(0o755)
+
+
+def test_a_read_reports_the_requested_documents_id_not_its_targets(tmp_path: Path) -> None:
+    """`read()` returned the symlink *target*'s id, so it disagreed with the index and a claim
+    built from a subagent's own read was refused by the per-question citation check."""
+    from workbench.core.sources import document_id
+
+    root = tmp_path / "pack"
+    root.mkdir()
+    (root / "notes.md").write_text("evidence inside the root\n", encoding="utf-8")
+    (root / "alias.md").symlink_to(root / "notes.md")
+    served = _library(root).read("alias.md")
+    assert served.path == "alias.md"
+    assert served.doc_id == document_id(ACME, "alias.md")
+
+
+def test_a_normalised_path_reports_the_normalised_id(tmp_path: Path) -> None:
+    from workbench.core.sources import document_id
+
+    root = tmp_path / "pack"
+    (root / "interviews").mkdir(parents=True)
+    (root / "interviews" / "a.md").write_text("evidence\n", encoding="utf-8")
+    served = _library(root).read("interviews/./a.md")
+    assert served.path == "interviews/a.md"
+    assert served.doc_id == document_id(ACME, "interviews/a.md")
+
+
+def test_a_served_name_pointing_at_a_refused_target_is_refused(tmp_path: Path) -> None:
+    """Both names are screened on a read, not only on a listing."""
+    root = tmp_path / "pack"
+    root.mkdir()
+    (root / "manifest.json").write_text('{"planted_facts": []}\n', encoding="utf-8")
+    (root / "notes.md").symlink_to(root / "manifest.json")
+    with pytest.raises(SourceRefused):
+        _library(root).read("notes.md")
+
+
+def test_an_os_error_on_a_read_becomes_a_workbench_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The deterministic form of the two tests above, which skip when the process is root: the
+    `OSError` is injected, so the mapping is proved on every machine and in CI either way."""
+
+    def deny(self: Path) -> bytes:
+        raise OSError(13, "Permission denied", str(self))
+
+    root = tmp_path / "pack"
+    root.mkdir()
+    (root / "notes.md").write_text("evidence\n", encoding="utf-8")
+    library = _library(root)
+    monkeypatch.setattr(Path, "read_bytes", deny)
+    with pytest.raises(SourceUnreadable) as refusal:
+        library.read("notes.md")
+    assert str(root) not in str(refusal.value)
+    with pytest.raises(SourceUnreadable):
+        library.verify_quote("notes.md", "a quote long enough to pass the floor")
+    # And a listing degrades to "unreadable" rather than raising.
+    (ref,) = library.list_documents()
+    assert ref.readable is False
+    assert ref.unread_reason is not None
+    assert str(root) not in ref.unread_reason
