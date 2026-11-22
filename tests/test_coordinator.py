@@ -7,6 +7,7 @@ of them rests on.
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 
 import pytest
 from agent_container.core.budget import Budget
@@ -465,3 +466,81 @@ def test_a_cancelled_run_still_records_every_subagent(pack: Pack, pack_analyst: 
     assert set(pack.store.failed_run_question_ids(pack_analyst, ACME)) == {
         question.id for question in questions
     }
+
+
+# ---- the per-subagent source budget --------------------------------------------------------
+
+
+def test_no_subagent_is_starved_by_a_sibling_s_reading(tmp_path: Path) -> None:
+    """Codex's case, reproduced: six subagents each naming one large document of their own.
+
+    On a shared `SourceLibrary` the run's byte cap is charged for everything the library serves,
+    while the tool delivers only the per-answer share -- so early subagents spent six times what
+    they handed over and the last two read nothing, their own documents, inside their own caps,
+    lost to a sibling's accounting. A library per subagent makes the charge local.
+    """
+    from datetime import UTC, datetime
+    from itertools import count
+
+    from workbench.core.config import MAX_SOURCE_RUN_BYTES, Config
+    from workbench.core.principals import Role
+    from workbench.core.store import Store
+
+    documents = 6
+    root = tmp_path / "sources" / ACME
+    root.mkdir(parents=True)
+    # Each document alone is under the per-file cap, and six of them together are over the
+    # shared per-run cap -- which is the whole point.
+    size = 90_000
+    assert documents * size > MAX_SOURCE_RUN_BYTES
+    for n in range(1, documents + 1):
+        (root / f"doc{n}.md").write_text(f"document {n}\n" + ("x" * size), encoding="utf-8")
+
+    config = Config(database_path=tmp_path / "wb.sqlite3", sources_root=tmp_path / "sources")
+    ids = count(1)
+    with Store.open(
+        config,
+        now=lambda: datetime(2026, 11, 22, 6, 0, tzinfo=UTC),
+        new_id=lambda: f"id-{next(ids):04d}",
+    ) as store:
+        store.build()
+        analyst = store.load_principal("analyst-rao", Role.ANALYST)
+        library = SourceLibrary.for_engagement(config, ACME)
+        index = store.index_sources(analyst, ACME, library)
+        doc_ids = [ref.doc_id for ref in index]
+        assert len(doc_ids) == documents
+
+        plan = {
+            "questions": [
+                {
+                    "text": f"What does document {n} say?",
+                    "specialist": "process",
+                    "doc_ids": [doc_id],
+                    "rationale": "one document each",
+                }
+                for n, doc_id in enumerate(doc_ids, start=1)
+            ],
+            "strategy_note": "one document per question",
+        }
+        source = recording_source(
+            plan_payload=plan,
+            specialists={
+                str(n): answering_specialist([doc_id], answer([]))
+                for n, doc_id in enumerate(doc_ids, start=1)
+            },
+        )
+        result = asyncio.run(
+            DiscoveryCoordinator(store, config, source).discover(analyst, ACME, budget=_budget())
+        )
+
+    assert [o.state for o in result.outcomes] == ["ok"] * documents
+    # Each document is legitimately trimmed to its subagent's own 20,000-character cap -- that is
+    # the spec's limit, not starvation. Starvation is the OTHER reason: "already spent on earlier
+    # documents". No subagent may see it, and every one must have been served something.
+    for outcome in result.outcomes:
+        for doc_id, reason in outcome.unread.items():
+            assert "already spent" not in reason, f"q{outcome.seq} was starved: {reason}"
+            assert "none of this document was read" not in reason, (
+                f"q{outcome.seq} read nothing: {reason}"
+            )
+            assert "share of the per-answer reading budget" in reason, (doc_id, reason)

@@ -306,7 +306,22 @@ class DiscoveryCoordinator:
         ) -> _Attempt:
             if missing is not None:
                 return _Attempt(question, None, None, InvalidInput(missing))
-            reader = ReadDocumentTool(library, paths, char_budget=self._config.answer_input_cap)
+            # A source library **per subagent**, not the run's shared one. `SourceLibrary.read`
+            # charges its own per-run byte cap for everything it serves, and this tool then trims
+            # that down to the document's share of the per-answer budget -- so on a shared library
+            # a subagent handed a 120,000-byte document spent 120,000 of the run's 400,000 bytes
+            # to deliver 20,000, and the fifth and sixth subagents of a six-question plan read
+            # nothing at all. Their own documents, within their own caps, starved by a sibling's
+            # accounting. A fresh library per subagent makes the charge local: each one may serve
+            # up to its own cap, the tool bounds delivery to `answer_input_cap`, and six subagents
+            # are bounded by 6 x `answer_input_cap` rather than by one shared allowance they race
+            # for. Fixing the charge inside `SourceLibrary.read` would need a `limit` parameter in
+            # `workbench/core/`, which this slice may not edit.
+            reader = ReadDocumentTool(
+                SourceLibrary.for_engagement(self._config, engagement_id),
+                paths,
+                char_budget=self._config.answer_input_cap,
+            )
             submit = SubmitAnswerTool()
             agent = SpecialistAgent(
                 # The position in THIS plan, never `question.seq`. `seq` continues the
