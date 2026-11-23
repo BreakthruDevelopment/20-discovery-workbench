@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import http.client
+import json
 import socket
 import threading
 import time
@@ -135,3 +136,104 @@ def test_serve_rejects_a_port_outside_the_range(capsys: pytest.CaptureFixture[st
     captured = capsys.readouterr()
     assert "invalid_input" in captured.out
     assert "70000" not in captured.out
+
+
+def _raw(host: str, port: int, request: bytes, *, timeout: float = 5.0) -> bytes:
+    """One raw request on a socket. `http.client` will not send a malformed request line."""
+    with socket.create_connection((host, port), timeout=timeout) as sock:
+        sock.sendall(request)
+        sock.settimeout(timeout)
+        chunks: list[bytes] = []
+        while True:
+            try:
+                chunk = sock.recv(4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def test_a_malformed_request_line_still_gets_a_response(
+    server: tuple[str, int], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`self.path` does not exist until `parse_request()` succeeds.
+
+    `send_error` calls `send_response` calls `log_request`, which read `self.path` and
+    raised `AttributeError` -- leaving the status line buffered and never flushed, so the
+    client received **zero bytes** instead of a 400, and the traceback went to stderr and
+    broke the one-JSON-line-per-request log contract. One line of input, unauthenticated,
+    repeatable.
+    """
+    host, port = server
+    capsys.readouterr()
+    response = _raw(host, port, b"GET /CANARY-IN-REQUEST-LINE HTTP/9.9\r\n\r\n")
+    assert response, "the client received no bytes at all"
+    # 505, not 400: `parse_request()` rejects the version before the path, which is the
+    # status this handler is handed. What matters is that a complete response arrives.
+    assert response.startswith(b"HTTP/1.1 505 ")
+    assert b"http_version_not_supported\n" in response
+    # Nothing from the request line comes back, and the log is still one JSON line.
+    assert b"CANARY-IN-REQUEST-LINE" not in response
+    captured = capsys.readouterr()
+    assert "Traceback" not in captured.err
+    lines = [line for line in captured.err.splitlines() if line.strip()]
+    assert len(lines) == 1
+    assert json.loads(lines[0])["event"] == "http"
+
+
+def test_an_unparseable_request_line_is_not_echoed(server: tuple[str, int]) -> None:
+    host, port = server
+    response = _raw(host, port, b"BOGUS\xff CANARY2 JUNK\r\n\r\n")
+    assert response.startswith(b"HTTP/1.1 400 ")
+    assert b"CANARY2" not in response
+
+
+def test_an_unsupported_method_is_not_echoed(server: tuple[str, int]) -> None:
+    """The base class puts `self.command` in the reason phrase *and* in an HTML body.
+
+    That is parsed request input in a response, on a surface whose only declared content
+    type is text/plain -- the app 17 defect class, six routes over five rounds.
+    """
+    host, port = server
+    canary = b"CANARYMETHOD"
+    response = _raw(host, port, canary + b" / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+    assert response.startswith(b"HTTP/1.1 405 ")
+    assert b"method_not_allowed\n" in response
+    assert canary not in response
+    # And the content type stays the only one this surface declares.
+    assert b"text/html" not in response.lower()
+    assert b"text/plain" in response.lower()
+
+
+@pytest.mark.parametrize("method", ["POST", "PUT", "DELETE", "PATCH", "OPTIONS", "TRACE"])
+def test_every_other_verb_is_a_fixed_plain_text_405(server: tuple[str, int], method: str) -> None:
+    host, port = server
+    response = _raw(host, port, f"{method} /healthz HTTP/1.1\r\nHost: localhost\r\n\r\n".encode())
+    assert response.startswith(b"HTTP/1.1 405 ")
+    assert b"method_not_allowed\n" in response
+    assert b"text/html" not in response.lower()
+
+
+def test_healthz_is_wired_to_the_real_round_trip(
+    server: tuple[str, int], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The route must call the round-trip, not merely report a version.
+
+    Replacing `replay_round_trip` with a constant success left every test passing, so
+    nothing pinned that `/healthz` depends on the loop at all. This drives the recorded
+    provider instead: a provider whose reply stops for any other reason is a failed
+    round-trip and a 500, which is the whole point of the endpoint.
+    """
+
+    class _OtherStop(ModelProvider):
+        async def converse(self, request: ModelRequest) -> ModelResponse:
+            del request
+            return ModelResponse.of(http_mod._RECORDED_TEXT, stop_reason="max_tokens")
+
+    monkeypatch.setattr(http_mod, "_recorded_provider", _OtherStop)
+    host, port = server
+    status, body = _get(host, port, "/healthz")
+    assert status == 500
+    assert "replay: failed\n" in body
