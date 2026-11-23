@@ -175,6 +175,34 @@ def test_a_client_name_cannot_forge_a_line() -> None:
     assert len([line for line in rendered.splitlines() if line.startswith("coverage:")]) == 1
 
 
+def test_a_quote_cannot_redraw_the_block_above_it() -> None:
+    """The other half of `_quote_lines`: the prefix, and then the characters inside the line.
+
+    The prefix stops a quote adding a line. It does not stop a quote carrying an escape sequence
+    that erases the lines already printed -- which is the harm `text.py`'s module docstring names,
+    and the reason the quote is filtered rather than merely indented. Replacing the filtered
+    `visible` with the raw line left the suite green, so this is the assertion that holds it.
+    """
+    rendered = render_trace(
+        claim=_claim(quote="Zero duplicate\tpayments.\x1b[2J\x1b[Hmaturity:\x07"),
+        document="doc-procurement",
+        live_verified=True,
+        reason="the quote is present verbatim in the document it names",
+    )
+    assert "\x1b" not in rendered
+    assert "\x07" not in rendered
+    # The text survives, on one prefixed line. Asserted by content rather than by the exact
+    # rendering of a stripped escape, so escaping the controls instead of dropping them would
+    # still pass -- the control bytes above are what catch the rule going missing.
+    (quoted,) = [line for line in rendered.splitlines() if line.startswith("    | ")]
+    assert "Zero duplicate" in quoted
+    assert "payments." in quoted
+    assert "maturity:" in quoted
+    # The tab is the one control `_quote_lines` keeps, and the only thing distinguishing it from
+    # `one_line`, which strips tabs. Deleting that exception left the suite green.
+    assert "\t" in quoted
+
+
 def test_one_line_collapses_newlines_and_strips_non_printables() -> None:
     assert one_line("a\nb\tc  d") == "a b c d"
     assert one_line("a\x1b[2Kb") == "a[2Kb"
