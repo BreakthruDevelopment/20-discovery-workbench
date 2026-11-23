@@ -193,6 +193,29 @@ def test_a_subclass_cannot_replace_the_skeleton(method: str) -> None:
         _SkeletonMeta("Broken", (ReadoutTemplate,), {method: lambda *_args, **_kwargs: None})
 
 
+def test_every_skeleton_method_is_in_the_locked_set() -> None:
+    """`_LOCKED` is hand-maintained, so a new `_lock_*` step would be silently overridable.
+
+    The parametrized test above only proves the seven names currently listed are refused. This
+    one closes the gap the other way round: the skeleton's own entry point plus every `_lock_*`
+    and `_attach_*` method defined on `ReadoutTemplate` must appear in `_LOCKED`.
+    """
+    # No `callable()` filter: in 3.12 `callable(classmethod(f))` and `callable(property(f))` are
+    # both False, so a descriptor-shaped lock left out of `_LOCKED` would be invisible to it. The
+    # whole MRO, not just `vars(ReadoutTemplate)`, so a lock added on a future base is seen too.
+    defined = {
+        name
+        for klass in ReadoutTemplate.__mro__
+        if klass is not object
+        for name in vars(klass)
+        if name.startswith(("_lock_", "_attach_"))
+    }
+    defined.add("assemble")
+    assert defined <= _SkeletonMeta._LOCKED, sorted(defined - _SkeletonMeta._LOCKED)
+    # And nothing is listed that does not exist, which would read as cover it does not give.
+    assert defined >= _SkeletonMeta._LOCKED, sorted(_SkeletonMeta._LOCKED - defined)
+
+
 def test_the_steps_run_in_skeleton_order() -> None:
     seen: list[str] = []
 
