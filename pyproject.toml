@@ -51,8 +51,9 @@ select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF", "S", "ASYNC"]
 strict = true
 python_version = "3.12"
 # The pack generator lives under sources/acme-p2p/ and is not an importable package
-# (the directory name is hyphenated). It is still held to this strict check.
-files = ["workbench", "tests", "sources/acme-p2p/generate.py"]
+# (the directory name is hyphenated). The coverage-map script is the same kind of
+# file: pytest runs it, and it is not a package. Both are held to this strict check.
+files = ["workbench", "tests", "sources/acme-p2p/generate.py", "scripts/coverage_map.py"]
 warn_unreachable = true
 
 [tool.pytest.ini_options]
