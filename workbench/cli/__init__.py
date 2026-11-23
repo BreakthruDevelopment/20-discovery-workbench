@@ -4,7 +4,7 @@ import argparse
 from collections.abc import Sequence
 
 from workbench import __version__
-from workbench.cli import discover
+from workbench.cli import discover, readout
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -23,6 +23,36 @@ def build_parser() -> argparse.ArgumentParser:
             ),
         )
     )
+    readout.add_readout(
+        sub.add_parser(
+            "readout",
+            help="synthesise and render the readout, coverage gaps first",
+            description=(
+                "Synthesise a draft readout from verified claims and render it with coverage "
+                "first. A final readout is rendered as stored."
+            ),
+        )
+    )
+    readout.add_trace(
+        sub.add_parser(
+            "trace",
+            help="show one claim, its quote and whether that quote checks out",
+            description=(
+                "Show one claim, the document it cites, the verbatim quote, and the result of "
+                "checking that quote against the document."
+            ),
+        )
+    )
+    readout.add_finalise(
+        sub.add_parser(
+            "finalise",
+            help="mark the readout final (lead only)",
+            description=(
+                "Mark the readout final. Refuses while a subagent run failed unless "
+                "--accept-gaps is given, which is recorded."
+            ),
+        )
+    )
     return parser
 
 
@@ -30,5 +60,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "discover":
         return discover.run(args)
+    if args.command == "readout":
+        return readout.run_readout(args)
+    if args.command == "trace":
+        return readout.run_trace(args)
+    if args.command == "finalise":
+        return readout.run_finalise(args)
     print(f"wb {__version__}: no command given; see --help")
     return 0

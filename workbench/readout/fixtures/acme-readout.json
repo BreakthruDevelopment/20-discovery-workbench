@@ -1,0 +1,109 @@
+{
+  "replies": [
+    {
+      "stop_reason": "tool_use",
+      "text": "",
+      "tool_uses": [
+        {
+          "id": "readout-1",
+          "name": "submit_readout",
+          "input": {
+            "maturity": [
+              {
+                "dimension": "invoice matching",
+                "level": 2,
+                "claim_ids": ["C1"]
+              },
+              {
+                "dimension": "systems landscape",
+                "level": 2,
+                "claim_ids": ["C5"]
+              },
+              {
+                "dimension": "change history",
+                "level": 2,
+                "claim_ids": ["C7"]
+              },
+              {
+                "dimension": "cycle time",
+                "level": 3,
+                "claim_ids": ["C2"]
+              },
+              {
+                "dimension": "exception handling",
+                "level": 5,
+                "claim_ids": []
+              }
+            ],
+            "outcomes": [
+              {
+                "outcome": "Three-way matching is done by hand.",
+                "claim_ids": ["C1"],
+                "confidence": 0.95
+              },
+              {
+                "outcome": "The average invoice cycle last quarter was 9 days.",
+                "claim_ids": ["C2"],
+                "confidence": 0.9
+              },
+              {
+                "outcome": "An integration from a former analyst's laptop is absent from the inventory.",
+                "claim_ids": ["C5"],
+                "confidence": 0.9
+              },
+              {
+                "outcome": "The Harbour supplier-portal project was cancelled.",
+                "claim_ids": ["C7"],
+                "confidence": 0.95
+              },
+              {
+                "outcome": "Duplicate payments have effectively stopped.",
+                "claim_ids": ["C3"],
+                "confidence": 0.4
+              },
+              {
+                "outcome": "On balance, duplicate payments are rare.",
+                "claim_ids": ["C3", "C4"],
+                "confidence": 0.5
+              },
+              {
+                "outcome": "Maturity is uniformly high.",
+                "claim_ids": [],
+                "confidence": 0.2
+              }
+            ],
+            "roi": {
+              "driver": "manual three-way matching and a 9-day invoice cycle",
+              "basis_claim_ids": ["C1", "C2"],
+              "low": 1,
+              "high": 3,
+              "assumption": "A range only, and only where a verified claim names the driver. Not a business case."
+            },
+            "roadmap": [
+              {
+                "phase": "Stop the undocumented mailbox copy",
+                "weeks": 4,
+                "depends_on": []
+              },
+              {
+                "phase": "Replace manual three-way matching",
+                "weeks": 8,
+                "depends_on": ["Stop the undocumented mailbox copy"]
+              }
+            ],
+            "coverage": {
+              "questions_total": 5,
+              "answered": 5,
+              "failed": 0,
+              "gaps": []
+            }
+          }
+        }
+      ],
+      "usage": {
+        "input_tokens": 4200,
+        "output_tokens": 900
+      }
+    }
+  ]
+}
