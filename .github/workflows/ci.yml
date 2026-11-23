@@ -105,9 +105,15 @@ jobs:
         run: docker run --rm wb:ci --version | grep -q "^wb 0.1.0$"
       - name: The image serves with no arguments
         # The gap this closes: six slices merged with an image whose CMD printed a version and
-        # exited, and nothing anywhere noticed. Every assertion below fails on that image --
-        # verified by running these steps against CMD ["--version"], where the container had
-        # already exited by the first curl.
+        # exited, and nothing anywhere noticed. On that image the container is gone before the
+        # first curl, so the retry loop runs out and `curl -fsS` fails the step.
+        #
+        # This job is the only place the container itself is exercised; it was written without a
+        # Docker daemon available, so the image half is proven by this job's own first green run
+        # and not by a local one. What WAS measured locally, on the installed CLI: `wb serve`
+        # with no arguments prints `listening: http://0.0.0.0:8080/` and answers both routes,
+        # `PORT=9123 wb serve` listens on 9123, and `scripts/smoke.sh --url` passes against it.
+        # `tests/test_image.py` pins the Dockerfile directives those two facts combine with.
         run: |
           id=$(docker run -d -p 8080:8080 wb:ci)
           trap 'docker rm -f "$id" >/dev/null 2>&1 || true' EXIT
