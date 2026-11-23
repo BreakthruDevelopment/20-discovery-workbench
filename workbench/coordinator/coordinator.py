@@ -434,9 +434,10 @@ class DiscoveryCoordinator:
                         exc,
                         0,
                         0,
-                        unread=dict(attempt.reader.unread_reasons)
-                        if attempt.reader is not None
-                        else {},
+                        # The helper, not `reader.unread_reasons`: the sweep for a document
+                        # the subagent never opened is the half the reader cannot know about,
+                        # and a question whose *recording* failed is no less entitled to it.
+                        unread=_unread_for(question, attempt.reader),
                     )
                 )
         return tuple(outcomes)
