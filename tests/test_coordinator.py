@@ -1044,6 +1044,60 @@ def test_a_document_the_subagent_never_opened_is_reported_unread(
     assert "never read" not in outcome.unread.get(CLERK, "")
 
 
+def test_a_question_whose_recording_fails_still_reports_the_never_read_document(
+    pack: Pack, pack_analyst: Principal
+) -> None:
+    """The same sweep, on the recording-failure path.
+
+    The ok path above calls `_unread_for`; this path used to build its unread set straight from
+    `attempt.reader.unread_reasons`, which holds only documents the subagent asked for. So a
+    question whose *recording* failed reported an unread set missing exactly the documents the
+    helper exists to add -- the never-opened ones -- and nothing pinned the difference: the two
+    expressions were interchangeable with the suite green either way.
+    """
+    source = recording_source(
+        plan_payload={
+            "questions": [
+                {
+                    "text": "how is matching done?",
+                    "specialist": "process",
+                    "doc_ids": [CLERK, POLICY],
+                    "rationale": "two documents, one of which the subagent ignores",
+                }
+            ],
+            "strategy_note": "a note",
+        },
+        specialists={
+            "1": answering_specialist(
+                [CLERK],
+                answer([finding(claim="manual matching", doc_id=CLERK, quote=MATCHING)]),
+            )
+        },
+    )
+
+    class _Refusing:
+        """Refuse the batch from inside the recording loop, as an unreadable document would."""
+
+        def __init__(self, inner: object) -> None:
+            self._inner = inner
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self._inner, name)
+
+        def record_claims(self, *args: object, **kwargs: object) -> object:
+            raise InvalidInput("the store refuses this batch")
+
+    coordinator = DiscoveryCoordinator(cast("Store", _Refusing(pack.store)), pack.config, source)
+    result = asyncio.run(coordinator.discover(pack_analyst, ACME, budget=_budget()))
+    (outcome,) = result.outcomes
+    # The recording failed, so this is a failed row -- and it still names the ignored document.
+    assert outcome.state == "failed"
+    assert POLICY in outcome.unread
+    assert "never read" in outcome.unread[POLICY]
+    # The document it did read is not swept in, on this path either.
+    assert "never read" not in outcome.unread.get(CLERK, "")
+
+
 def test_a_screened_out_plan_is_not_replanned(pack: Pack, pack_analyst: Principal) -> None:
     """The planner is asked **once** when every question is dropped by the document screen.
 
