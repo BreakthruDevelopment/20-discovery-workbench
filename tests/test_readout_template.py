@@ -200,10 +200,15 @@ def test_every_skeleton_method_is_in_the_locked_set() -> None:
     one closes the gap the other way round: the skeleton's own entry point plus every `_lock_*`
     and `_attach_*` method defined on `ReadoutTemplate` must appear in `_LOCKED`.
     """
+    # No `callable()` filter: in 3.12 `callable(classmethod(f))` and `callable(property(f))` are
+    # both False, so a descriptor-shaped lock left out of `_LOCKED` would be invisible to it. The
+    # whole MRO, not just `vars(ReadoutTemplate)`, so a lock added on a future base is seen too.
     defined = {
         name
-        for name in vars(ReadoutTemplate)
-        if name.startswith(("_lock_", "_attach_")) and callable(vars(ReadoutTemplate)[name])
+        for klass in ReadoutTemplate.__mro__
+        if klass is not object
+        for name in vars(klass)
+        if name.startswith(("_lock_", "_attach_"))
     }
     defined.add("assemble")
     assert defined <= _SkeletonMeta._LOCKED, sorted(defined - _SkeletonMeta._LOCKED)
