@@ -63,6 +63,12 @@ jobs:
           # on its first query.
           /tmp/wheel-check/bin/python -P -c "from workbench.core import store; \
             assert store._SCHEMA_PATH.is_file() and store._SEED_PATH.is_file()"
+          # The same for the committed recordings. The demo and the replay provider read these,
+          # so a .json left out of the build is a wheel whose `wb demo` fails at the first reply
+          # while every test in the checkout still passes.
+          /tmp/wheel-check/bin/python -P -c "from workbench.cli import discover; \
+            from workbench.readout import synthesis; \
+            assert discover.FIXTURE.is_file() and synthesis.FIXTURE.is_file()"
       - name: Smoke test (installed CLI)
         # PYTHONSAFEPATH is the console script's `-P`. Belt and braces rather than a fix: a
         # console script's own sys.path[0] is /tmp/wheel-check/bin, never the checkout root, so
