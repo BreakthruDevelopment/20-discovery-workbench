@@ -6,8 +6,8 @@ from importlib.metadata import distribution
 from pathlib import Path
 
 PYPROJECT = Path(__file__).resolve().parent.parent / "pyproject.toml"
-PIN_TAG = "v0.1.0"
-PIN_COMMIT = "9955f1f3ca06899973e41602277362dc336bb1ae"
+PIN_TAG = "v0.1.1"
+PIN_COMMIT = "8b3d030fadc5599077d04078945b6f8d036c5731"
 
 
 def test_pyproject_pins_app17_by_tag_not_branch_or_commit() -> None:

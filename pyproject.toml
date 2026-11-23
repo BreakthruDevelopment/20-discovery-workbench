@@ -5,8 +5,13 @@ description = "Discovery workbench: a coordinator that fans scoped questions out
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
-    # App 17 (the agent container) is pinned by git TAG, never a branch or a bare commit. v0.1.0 is an annotated tag
-    # on 9955f1f. A slice that needs something later than this tag stops and comments on its issue.
+    # App 17 (the agent container) is pinned by git TAG, never a branch or a bare commit. v0.1.1 is an annotated tag
+    # on 8b3d030. A slice that needs something later than this tag stops and comments on its issue.
+    # Moving this pin means regenerating uv.lock, because the lock records the resolved COMMIT, not
+    # the tag. Three things catch a bump made here without `uv lock`: this repo's CI runs
+    # `uv sync --locked` (which validates the lock against this file; `--frozen` would not, which is
+    # 17-agent-container#16) and `uv run --frozen` on every step, and tests/test_app17_pin.py asserts
+    # the installed commit. Update that test's PIN_TAG and PIN_COMMIT in the same change.
     "agent-container",
 ]
 
@@ -14,7 +19,7 @@ dependencies = [
 wb = "workbench.cli:main"
 
 [tool.uv.sources]
-agent-container = { git = "https://github.com/BreakthruDevelopment/17-agent-container", tag = "v0.1.0" }
+agent-container = { git = "https://github.com/BreakthruDevelopment/17-agent-container", tag = "v0.1.1" }
 
 [dependency-groups]
 dev = [
