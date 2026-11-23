@@ -237,3 +237,90 @@ def test_healthz_is_wired_to_the_real_round_trip(
     status, body = _get(host, port, "/healthz")
     assert status == 500
     assert "replay: failed\n" in body
+
+
+def test_the_host_defaults_to_every_interface_so_a_container_is_reachable() -> None:
+    """127.0.0.1 inside a container has no client. This default is the deploy fix.
+
+    The literal, not `http_mod._DEFAULT_HOST`: compared against the constant the function
+    returns, this assertion holds for whatever that constant says and proves nothing.
+    """
+    assert http_mod.resolve_host(None, {}) == "0.0.0.0"  # noqa: S104 -- asserting the default
+
+
+def test_an_explicit_host_beats_the_environment() -> None:
+    assert http_mod.resolve_host("127.0.0.1", {"WB_HOST": "10.0.0.1"}) == "127.0.0.1"
+
+
+def test_the_host_comes_from_the_environment_when_no_flag_is_given() -> None:
+    assert http_mod.resolve_host(None, {"WB_HOST": "10.0.0.1"}) == "10.0.0.1"
+
+
+@pytest.mark.parametrize("bad", ["", "   ", "a host", "\t"])
+def test_a_blank_or_spaced_host_is_refused_rather_than_silently_replaced(bad: str) -> None:
+    with pytest.raises(http_mod.ConfigError) as caught:
+        http_mod.resolve_host(bad, {})
+    assert caught.value.code == "invalid_input: a host is required"
+
+
+def test_the_port_defaults_to_8080() -> None:
+    assert http_mod.resolve_port(None, {}) == 8080
+
+
+def test_the_port_comes_from_the_environment_because_the_platform_hands_it_over() -> None:
+    assert http_mod.resolve_port(None, {"PORT": "9123"}) == 9123
+
+
+def test_an_explicit_port_beats_the_environment() -> None:
+    assert http_mod.resolve_port(443, {"PORT": "9123"}) == 443
+
+
+def test_a_blank_port_variable_falls_back_rather_than_failing() -> None:
+    """An empty PORT is an unset PORT, which is how a bare `docker run` arrives."""
+    assert http_mod.resolve_port(None, {"PORT": "  "}) == 8080
+
+
+@pytest.mark.parametrize("bad", ["eight", "80 80", "8080.0", "0x1f90", "٨٠٨٠"])
+def test_a_malformed_port_variable_is_refused_and_not_echoed(bad: str) -> None:
+    """Falling back to 8080 would bind somewhere the platform is not health-checking.
+
+    `٨٠٨٠` is Arabic-Indic digits, which `int()` accepts and a port parser must not:
+    the platform wrote `PORT` as ASCII or it meant something else.
+    """
+    with pytest.raises(http_mod.ConfigError) as caught:
+        http_mod.resolve_port(None, {"PORT": bad})
+    assert caught.value.code == "invalid_input: PORT is not a number"
+    assert bad not in caught.value.code
+
+
+@pytest.mark.parametrize("bad", ["70000", "-1", "65536"])
+def test_a_port_variable_outside_the_range_is_refused(bad: str) -> None:
+    with pytest.raises(http_mod.ConfigError) as caught:
+        http_mod.resolve_port(None, {"PORT": bad})
+    assert caught.value.code == "invalid_input: a port is between 0 and 65535"
+
+
+def test_serve_refuses_a_malformed_port_variable(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("PORT", "not-a-port")
+    assert main(["serve"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == "invalid_input: PORT is not a number\n"
+    assert "not-a-port" not in captured.out
+
+
+def test_a_malformed_port_variable_does_not_break_the_rest_of_the_cli(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`PORT` is read in `run()`, not as an argparse default.
+
+    `build_parser()` runs for every invocation, so resolving `PORT` there would make one
+    bad variable in the deploy environment break `wb --version`, `wb sources list` and
+    every other command along with `serve`.
+    """
+    monkeypatch.setenv("PORT", "not-a-port")
+    with pytest.raises(SystemExit) as caught:
+        main(["--version"])
+    assert caught.value.code == 0
+    assert capsys.readouterr().out == f"wb {__version__}\n"

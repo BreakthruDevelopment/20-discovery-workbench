@@ -4,6 +4,10 @@
 loop. The reply is recorded in this module. There is no Bedrock call and no
 source read: a deploy can smoke this without a database or the discovery pack.
 
+`wb serve` binds every interface and takes its port from `PORT` when `--port` is not
+given, because the deployed container is handed both by the platform. The image's
+default command is `serve`, and `tests/test_image.py` is what fails if that changes.
+
 `GET /` serves the committed exam-coverage map. It does not regenerate it. The
 line numbers stay what `scripts/coverage_map.py` wrote, and pytest is what fails
 when they drift.
@@ -14,7 +18,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sys
+from collections.abc import Mapping
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, ClassVar
@@ -31,6 +37,11 @@ _RECORDED_TEXT = "replay-ok"
 _HTTP_0_9 = "HTTP/0.9"
 _PHRASES = frozenset({400, 404, 405, 500, 505})
 _TEXT = "text/plain; charset=utf-8"
+#: The container has no loopback client, so an unset host binds every interface.
+_DEFAULT_HOST = "0.0.0.0"  # noqa: S104 -- a container port is the deployed surface
+_DEFAULT_PORT = 8080
+_HOST_ENV = "WB_HOST"
+_PORT_ENV = "PORT"
 
 
 class Server(ThreadingHTTPServer):
@@ -90,14 +101,69 @@ def bind(host: str, port: int) -> Server:
     return Server((host, port), Handler)
 
 
-def run(args: argparse.Namespace) -> int:
-    host = str(args.host).strip()
-    port = int(args.port)
-    if not host or any(char.isspace() for char in host):
-        print("invalid_input: a host is required")
-        return 1
+class ConfigError(Exception):
+    """A host or port that cannot be used. Carries a fixed code, never the bad value."""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
+def resolve_host(given: str | None, environ: Mapping[str, str] | None = None) -> str:
+    """`--host`, else `WB_HOST`, else every interface.
+
+    Raises `ConfigError` rather than falling back when a value is present but unusable:
+    a deploy that silently binds somewhere other than where it was told to is a container
+    the platform health-checks forever.
+    """
+    env = os.environ if environ is None else environ
+    for raw in (given, env.get(_HOST_ENV)):
+        if raw is None:
+            continue
+        host = raw.strip()
+        if not host or any(char.isspace() for char in host):
+            raise ConfigError("invalid_input: a host is required")
+        return host
+    return _DEFAULT_HOST
+
+
+def resolve_port(given: int | None, environ: Mapping[str, str] | None = None) -> int:
+    """`--port`, else `PORT`, else 8080.
+
+    `PORT` is parsed here and not in `add_arguments`: the parser is built for every `wb`
+    invocation, so a malformed `PORT` resolved as an argparse default would break
+    `wb --version` and every other subcommand along with `serve`.
+    """
+    env = os.environ if environ is None else environ
+    if given is not None:
+        return _checked_port(given)
+    raw = (env.get(_PORT_ENV) or "").strip()
+    if not raw:
+        return _DEFAULT_PORT
+    # `isascii()` first: `int()` accepts any Unicode decimal digit, so without this
+    # `PORT="\u0668\u0660\u0668\u0660"` (Arabic-Indic) parses as 8080 and the container binds a
+    # port nothing asked for. A platform writes `PORT` in ASCII or it did not mean a port.
+    if not raw.isascii():
+        raise ConfigError("invalid_input: PORT is not a number")
+    try:
+        parsed = int(raw, 10)
+    except ValueError:
+        raise ConfigError("invalid_input: PORT is not a number") from None
+    return _checked_port(parsed)
+
+
+def _checked_port(port: int) -> int:
     if port < 0 or port > 65535:
-        print("invalid_input: a port is between 0 and 65535")
+        raise ConfigError("invalid_input: a port is between 0 and 65535")
+    return port
+
+
+def run(args: argparse.Namespace) -> int:
+    try:
+        host = resolve_host(getattr(args, "host", None))
+        port = resolve_port(getattr(args, "port", None))
+    except ConfigError as err:
+        print(err.code)
         return 1
     try:
         server = bind(host, port)
@@ -117,8 +183,19 @@ def run(args: argparse.Namespace) -> int:
 
 
 def add_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--host", default="127.0.0.1", help="address to bind (default 127.0.0.1)")
-    parser.add_argument("--port", type=int, default=8080, help="port to bind (default 8080)")
+    # `default=None` for both, resolved in `run()`. See `resolve_port` for why the
+    # environment is not read here.
+    parser.add_argument(
+        "--host",
+        default=None,
+        help=f"address to bind (default ${_HOST_ENV}, else {_DEFAULT_HOST})",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help=f"port to bind (default ${_PORT_ENV}, else {_DEFAULT_PORT})",
+    )
 
 
 class Handler(BaseHTTPRequestHandler):
