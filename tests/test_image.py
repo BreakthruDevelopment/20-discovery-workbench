@@ -138,11 +138,21 @@ def test_the_build_proves_the_adapter_matches_the_target_architecture() -> None:
     runtime check runs on amd64, so only a step inside the build itself covers the image that
     actually ships. Pinned here because deleting it would be silent.
     """
-    body = DOCKERFILE.read_text(encoding="utf-8")
-    assert "ARG TARGETARCH" in body, "the check needs the target platform"
-    assert "e_machine" in body, "the architecture check is gone"
+    # Comment lines are dropped first. Grepping the raw file would let the check be
+    # COMMENTED OUT rather than deleted and still pass -- and the build would stay green
+    # too, because a missing check breaks nothing, so this test is the only thing standing
+    # between the check and quiet removal. Commenting a step out to get past a confusing
+    # build failure is the realistic way it would go. Same idiom as
+    # `test_the_build_validates_the_lock` above.
+    live = "\n".join(
+        line
+        for line in DOCKERFILE.read_text(encoding="utf-8").splitlines()
+        if not line.strip().startswith("#")
+    )
+    assert "ARG TARGETARCH" in live, "the check needs the target platform"
+    assert "e_machine" in live, "the architecture check is gone"
     # The two values the check compares against, so a half-deleted case statement fails.
-    assert "want=62" in body and "want=183" in body
+    assert "want=62" in live and "want=183" in live
 
 
 def test_the_adapter_is_copied_before_the_image_drops_privileges() -> None:
