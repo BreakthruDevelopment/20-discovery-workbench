@@ -51,8 +51,19 @@ def _exec_form(name: str) -> list[str]:
     return parsed
 
 
-def test_the_image_entry_point_is_the_cli() -> None:
-    assert _exec_form("ENTRYPOINT") == ["wb"]
+def test_the_image_entry_point_is_the_cli_by_absolute_path() -> None:
+    """AWS requires an absolute path for a container image's entry point.
+
+    `wb` is at /opt/venv/bin/wb, reachable only via this image's own PATH. Lambda's documented
+    default PATH does not include it, so a bare `wb` depends on whether Lambda's init resolves
+    the command against the merged environment -- unobservable from here, and a failed init in
+    production if it does not. The template's bare `node` is not precedent: /usr/local/bin is
+    already on Lambda's default PATH.
+    """
+    entry = _exec_form("ENTRYPOINT")
+    assert entry == ["/opt/venv/bin/wb"]
+    # The property, not just the value: a future rename must stay absolute.
+    assert entry[0].startswith("/"), "the entry point must be an absolute path"
 
 
 def test_the_image_serves_by_default_rather_than_printing_a_version() -> None:
@@ -118,6 +129,20 @@ def test_the_image_carries_the_lambda_web_adapter() -> None:
     assert copies[0].endswith("/opt/extensions/lambda-adapter"), (
         "the adapter must land in /opt/extensions/, where Lambda runs extensions from"
     )
+
+
+def test_the_build_proves_the_adapter_matches_the_target_architecture() -> None:
+    """`COPY --from` an external image is the one step that could yield a wrong-arch binary.
+
+    The deployed image is arm64 (`stacks/aws/main.tf`: architectures = ["arm64"]) while ci.yml's
+    runtime check runs on amd64, so only a step inside the build itself covers the image that
+    actually ships. Pinned here because deleting it would be silent.
+    """
+    body = DOCKERFILE.read_text(encoding="utf-8")
+    assert "ARG TARGETARCH" in body, "the check needs the target platform"
+    assert "e_machine" in body, "the architecture check is gone"
+    # The two values the check compares against, so a half-deleted case statement fails.
+    assert "want=62" in body and "want=183" in body
 
 
 def test_the_adapter_is_copied_before_the_image_drops_privileges() -> None:
