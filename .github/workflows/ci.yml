@@ -101,4 +101,40 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
       - name: Run the CLI in the image
+        # Overrides CMD (now `serve`), so this still proves the entry point and the version.
         run: docker run --rm wb:ci --version | grep -q "^wb 0.1.0$"
+      - name: The image serves with no arguments
+        # The gap this closes: six slices merged with an image whose CMD printed a version and
+        # exited, and nothing anywhere noticed. On that image the container is gone before the
+        # first curl, so the retry loop runs out and `curl -fsS` fails the step.
+        #
+        # This job is the only place the container itself is exercised; it was written without a
+        # Docker daemon available, so the image half is proven by this job's own first green run
+        # and not by a local one. What WAS measured locally, on the installed CLI: `wb serve`
+        # with no arguments prints `listening: http://0.0.0.0:8080/` and answers both routes,
+        # `PORT=9123 wb serve` listens on 9123, and `scripts/smoke.sh --url` passes against it.
+        # `tests/test_image.py` pins the Dockerfile directives those two facts combine with.
+        run: |
+          id=$(docker run -d -p 8080:8080 wb:ci)
+          trap 'docker rm -f "$id" >/dev/null 2>&1 || true' EXIT
+          for _ in $(seq 1 30); do
+            curl -fsS --max-time 2 http://127.0.0.1:8080/healthz >/dev/null 2>&1 && break
+            sleep 1
+          done
+          # `--fail` so a 500 from a broken replay round-trip is a failure, not a logged body.
+          health=$(curl -fsS --max-time 10 http://127.0.0.1:8080/healthz)
+          grep -q "^version: 0.1.0$" <<<"$health"
+          grep -q "^replay: ok$" <<<"$health"
+          map=$(curl -fsS --max-time 10 http://127.0.0.1:8080/)
+          grep -q $'^5\.6\t' <<<"$map"
+          # Still running after being served, i.e. serve_forever rather than one reply and exit.
+          test "$(docker inspect -f '{{.State.Running}}' "$id")" = true
+      - name: The image takes its port from PORT
+        run: |
+          id=$(docker run -d -e PORT=9123 -p 9123:9123 wb:ci)
+          trap 'docker rm -f "$id" >/dev/null 2>&1 || true' EXIT
+          for _ in $(seq 1 30); do
+            curl -fsS --max-time 2 http://127.0.0.1:9123/healthz >/dev/null 2>&1 && break
+            sleep 1
+          done
+          curl -fsS --max-time 10 http://127.0.0.1:9123/healthz | grep -q "^replay: ok$"
