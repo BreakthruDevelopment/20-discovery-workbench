@@ -286,10 +286,14 @@ def test_a_malformed_port_variable_is_refused_and_not_echoed(bad: str) -> None:
 
     `٨٠٨٠` is Arabic-Indic digits, which `int()` accepts and a port parser must not:
     the platform wrote `PORT` as ASCII or it meant something else.
+
+    The code is checked as a substring, not for equality: once `code` equals a fixed
+    string, `bad not in code` holds for every `bad` by construction and cannot fail.
+    The exact printed line is pinned by `test_serve_refuses_a_malformed_port_variable`.
     """
     with pytest.raises(http_mod.ConfigError) as caught:
         http_mod.resolve_port(None, {"PORT": bad})
-    assert caught.value.code == "invalid_input: PORT is not a number"
+    assert "invalid_input: PORT is not a number" in caught.value.code
     assert bad not in caught.value.code
 
 
@@ -306,8 +310,8 @@ def test_serve_refuses_a_malformed_port_variable(
     monkeypatch.setenv("PORT", "not-a-port")
     assert main(["serve"]) == 1
     captured = capsys.readouterr()
+    # Equality is the leak-guard: interpolating the raw value changes this string.
     assert captured.out == "invalid_input: PORT is not a number\n"
-    assert "not-a-port" not in captured.out
 
 
 def test_a_malformed_port_variable_does_not_break_the_rest_of_the_cli(

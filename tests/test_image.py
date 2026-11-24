@@ -16,7 +16,7 @@ import json
 import shlex
 from pathlib import Path
 
-import pytest
+from workbench.cli.http import _DEFAULT_PORT
 
 DOCKERFILE = Path(__file__).resolve().parents[1] / "Dockerfile"
 
@@ -68,6 +68,11 @@ def test_the_build_validates_the_lock() -> None:
         assert "--frozen" not in words, "--frozen does not validate the lock; --locked does"
 
 
-@pytest.mark.parametrize("port", ["8080"])
-def test_the_image_documents_the_port_it_serves(port: str) -> None:
-    assert _directive("EXPOSE") == port
+def test_the_image_documents_the_default_port() -> None:
+    """EXPOSE documents the default. The served port comes from PORT at runtime.
+
+    Compared to `_DEFAULT_PORT` so the documented default and the code default
+    cannot drift. The image does not pin the runtime port: `PORT` is read when
+    the container starts, which is why CI also curls a `PORT=9123` run.
+    """
+    assert _directive("EXPOSE") == str(_DEFAULT_PORT)
