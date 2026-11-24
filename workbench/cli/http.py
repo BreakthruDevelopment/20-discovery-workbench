@@ -271,16 +271,27 @@ class Handler(BaseHTTPRequestHandler):
         self._send(status, body, include_body=include_body)
 
     def _send(self, status: int, body: str, *, include_body: bool) -> None:
-        """The one writer. Nothing derived from the request reaches a header or a body."""
+        """The one writer. Nothing derived from the request reaches a header or a body.
+
+        The writes are guarded the same way `_send_unparsed`'s is: a client that sends a valid
+        request and then aborts (`SO_LINGER 0`, an impatient health check) makes the header
+        flush in `end_headers` or the body write raise `ConnectionResetError`. Unguarded, that
+        reached `socketserver`'s `handle_error`, which printed a traceback -- server file paths
+        included -- beside the request's JSON line. `send_response` has already logged the
+        request by then, so it stays exactly one JSON line.
+        """
         data = body.encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", _TEXT)
-        self.send_header("Content-Length", str(len(data)))
-        self.send_header("Connection", "close")
-        self.end_headers()
         self.close_connection = True
-        if include_body:
-            self.wfile.write(data)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", _TEXT)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            if include_body:
+                self.wfile.write(data)
+        except OSError:
+            return
 
     def log_request(self, code: int | str = "-", size: int | str = "-") -> None:
         del size
