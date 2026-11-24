@@ -167,7 +167,11 @@ def run(args: argparse.Namespace) -> int:
         return 1
     try:
         server = bind(host, port)
-    except OSError:
+    # Not only `OSError`: `socket.bind` raises `TypeError` for a host it cannot encode -- a lone
+    # surrogate, which is how Python decodes an invalid UTF-8 byte in argv or `WB_HOST`, or a
+    # NUL -- and `ValueError` (which includes `UnicodeError`) from the IDNA codec. Each would
+    # otherwise exit with a traceback on a user-supplied value instead of this fixed code.
+    except (OSError, TypeError, ValueError):
         print("invalid_input: the address could not be bound")
         return 1
     raw_host, raw_port = server.server_address[:2]

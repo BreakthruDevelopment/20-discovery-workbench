@@ -138,6 +138,34 @@ def test_serve_rejects_a_port_outside_the_range(capsys: pytest.CaptureFixture[st
     assert "70000" not in captured.out
 
 
+@pytest.mark.parametrize(
+    "bad",
+    [
+        # `wb serve --host $'ho\xffst'`: Python decodes the invalid UTF-8 byte in argv as the
+        # lone surrogate U+DCFF, which `socket.bind` cannot encode (`TypeError`).
+        "ho\udcffst",
+        "ho\x00st",
+    ],
+)
+def test_a_host_the_socket_cannot_encode_exits_with_the_fixed_code(
+    capsys: pytest.CaptureFixture[str], bad: str
+) -> None:
+    """Issue #27. `bind` raised `TypeError`, which `except OSError` let through as a traceback."""
+    assert main(["serve", "--host", bad, "--port", "0"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == "invalid_input: the address could not be bound\n"
+    assert captured.err == ""
+
+
+def test_an_unencodable_host_variable_exits_with_the_fixed_code(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`WB_HOST` reaches the same `bind` call, so the same byte there must fail the same way."""
+    monkeypatch.setenv("WB_HOST", "ho\udcffst")
+    assert main(["serve", "--port", "0"]) == 1
+    assert capsys.readouterr().out == "invalid_input: the address could not be bound\n"
+
+
 def _raw(host: str, port: int, request: bytes, *, timeout: float = 5.0) -> bytes:
     """One raw request on a socket. `http.client` will not send a malformed request line."""
     with socket.create_connection((host, port), timeout=timeout) as sock:
