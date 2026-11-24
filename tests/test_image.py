@@ -8,6 +8,13 @@ nothing deployable existed and no test or workflow step said so (issue #24).
 no arguments and curls both routes. These assertions are the cheap half -- they run in
 `pytest`, need no Docker, and fail on the one-line edit that would put the image back to
 printing a version.
+
+The same applies to the Lambda Web Adapter (issue #29). `stacks/aws/main.tf` deploys this
+app as a `package_type = "Image"` Lambda, which cannot initialise without the adapter, and
+forwards to `AWS_LWA_PORT=3000` while setting no `PORT`. Neither fact is visible from inside
+the app, and neither is checkable without AWS -- so what is pinned here is the Dockerfile
+contract that those two facts require. These are the cheapest tests in the repo and they
+guard the most expensive failure: a deploy that fails init on every invoke.
 """
 
 from __future__ import annotations
@@ -15,8 +22,6 @@ from __future__ import annotations
 import json
 import shlex
 from pathlib import Path
-
-import pytest
 
 DOCKERFILE = Path(__file__).resolve().parents[1] / "Dockerfile"
 
@@ -68,6 +73,63 @@ def test_the_build_validates_the_lock() -> None:
         assert "--frozen" not in words, "--frozen does not validate the lock; --locked does"
 
 
-@pytest.mark.parametrize("port", ["8080"])
-def test_the_image_documents_the_port_it_serves(port: str) -> None:
-    assert _directive("EXPOSE") == port
+#: The port `stacks/aws/main.tf` sets as AWS_LWA_PORT for every app, with no PORT alongside it.
+LWA_FORWARD_PORT = "3000"
+
+#: The pinned adapter image 30-apps-template uses. Same version on purpose.
+ADAPTER = "public.ecr.aws/awsguru/aws-lambda-adapter:0.9.1"
+
+
+def _env() -> dict[str, str]:
+    """The runner stage's ENV assignments, as a dict. Only `KEY=value` words are read."""
+    body = DOCKERFILE.read_text(encoding="utf-8")
+    runner = body[body.index("AS runner") :]
+    found: dict[str, str] = {}
+    for line in runner.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("ENV "):
+            continue
+        for word in shlex.split(stripped.removeprefix("ENV ")):
+            key, sep, value = word.partition("=")
+            if sep:
+                found[key] = value
+    return found
+
+
+def test_the_image_sets_the_port_the_lambda_adapter_forwards_to() -> None:
+    """The deploy stack sets AWS_LWA_PORT=3000 and no PORT, so the image must supply it.
+
+    Without this the adapter forwards to 3000, `wb serve` binds its own default of 8080,
+    and the function answers nothing it is asked.
+    """
+    assert _env().get("PORT") == LWA_FORWARD_PORT
+
+
+def test_the_image_carries_the_lambda_web_adapter() -> None:
+    """A package_type="Image" Lambda cannot initialise without it. Issue #29."""
+    body = DOCKERFILE.read_text(encoding="utf-8")
+    copies = [
+        line.strip()
+        for line in body.splitlines()
+        if line.strip().startswith("COPY ") and "lambda-adapter" in line
+    ]
+    assert len(copies) == 1, "exactly one adapter COPY is expected"
+    assert f"--from={ADAPTER}" in copies[0], f"the adapter must come from {ADAPTER}"
+    assert copies[0].endswith("/opt/extensions/lambda-adapter"), (
+        "the adapter must land in /opt/extensions/, where Lambda runs extensions from"
+    )
+
+
+def test_the_adapter_is_copied_before_the_image_drops_privileges() -> None:
+    """COPY after USER lands it unreadable-to-root-only paths and can lose the exec bit."""
+    lines = [line.strip() for line in DOCKERFILE.read_text(encoding="utf-8").splitlines()]
+    adapter = next(
+        i for i, line in enumerate(lines) if "lambda-adapter" in line and line.startswith("COPY ")
+    )
+    user = next(i for i, line in enumerate(lines) if line.startswith("USER "))
+    assert adapter < user
+
+
+def test_the_documented_port_is_the_port_the_image_actually_serves() -> None:
+    """EXPOSE is documentation, so the thing worth asserting is that it has not drifted."""
+    assert _directive("EXPOSE") == _env().get("PORT")
