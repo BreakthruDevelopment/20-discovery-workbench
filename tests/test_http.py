@@ -280,17 +280,22 @@ def test_a_blank_port_variable_falls_back_rather_than_failing() -> None:
     assert http_mod.resolve_port(None, {"PORT": "  "}) == 8080
 
 
-@pytest.mark.parametrize("bad", ["eight", "80 80", "8080.0", "0x1f90", "٨٠٨٠"])
-def test_a_malformed_port_variable_is_refused_and_not_echoed(bad: str) -> None:
+#: `PORT` values that must be refused. `٨٠٨٠` is Arabic-Indic digits, which `int()` accepts and
+#: a port parser must not: the platform wrote `PORT` as ASCII or it meant something else.
+MALFORMED_PORTS = ["eight", "80 80", "8080.0", "0x1f90", "٨٠٨٠", "not-a-port"]
+
+
+@pytest.mark.parametrize("bad", MALFORMED_PORTS)
+def test_a_malformed_port_variable_is_refused(bad: str) -> None:
     """Falling back to 8080 would bind somewhere the platform is not health-checking.
 
-    `٨٠٨٠` is Arabic-Indic digits, which `int()` accepts and a port parser must not:
-    the platform wrote `PORT` as ASCII or it meant something else.
+    This pins the refusal and its fixed code. It is not the no-echo guard: once `code` equals
+    a fixed string, `bad not in code` holds by construction and cannot fail on its own (issue
+    #28). `test_serve_refuses_a_malformed_port_variable` below is the guard.
     """
     with pytest.raises(http_mod.ConfigError) as caught:
         http_mod.resolve_port(None, {"PORT": bad})
     assert caught.value.code == "invalid_input: PORT is not a number"
-    assert bad not in caught.value.code
 
 
 @pytest.mark.parametrize("bad", ["70000", "-1", "65536"])
@@ -300,14 +305,21 @@ def test_a_port_variable_outside_the_range_is_refused(bad: str) -> None:
     assert caught.value.code == "invalid_input: a port is between 0 and 65535"
 
 
+@pytest.mark.parametrize("bad", MALFORMED_PORTS)
 def test_serve_refuses_a_malformed_port_variable(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], bad: str
 ) -> None:
-    monkeypatch.setenv("PORT", "not-a-port")
+    """The no-echo guard: the whole of what `wb serve` prints, compared exactly.
+
+    Exact equality is the assertion that fails if the raw value is ever interpolated into the
+    message, whether into the code itself or around it; a `bad not in out` line beside it
+    would be implied and could not fail on its own, so there is none (issue #28).
+    """
+    monkeypatch.setenv("PORT", bad)
     assert main(["serve"]) == 1
     captured = capsys.readouterr()
     assert captured.out == "invalid_input: PORT is not a number\n"
-    assert "not-a-port" not in captured.out
+    assert captured.err == ""
 
 
 def test_a_malformed_port_variable_does_not_break_the_rest_of_the_cli(
