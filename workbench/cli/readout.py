@@ -21,7 +21,7 @@ import asyncio
 
 from agent_container.core.provider import ModelProvider
 
-from workbench.coordinator.providers import LiveSource
+from workbench.coordinator.providers import LiveSource, require_live
 from workbench.core.config import Config
 from workbench.core.errors import WorkbenchError
 from workbench.core.principals import Principal, Role
@@ -66,6 +66,14 @@ def run_readout(args: argparse.Namespace) -> int:
             store.build()
             principal = store.load_principal(args.principal, Role(args.role))
             current = store.readout(principal, args.engagement)
+            if args.live:
+                # Judged before the stored-final return, so the lead-only refusal is a check and
+                # not an accident of statement order. Same rule `LiveSource` applies; a final
+                # readout builds no `LiveSource` and calls no model.
+                # `engagement_summary`, not `engagement`: a sponsor may have the summary but not
+                # `READ_DISCOVERY`, and the refusal must come from `run_live`, not from that.
+                engagement_id, _client, state = store.engagement_summary(principal, args.engagement)
+                require_live(principal, engagement_id, state)
             if current.state == READOUT_FINAL:
                 rendered = current
             else:
