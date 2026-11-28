@@ -3,6 +3,8 @@
 `/healthz` reports the package version and one replay round-trip through app 17's
 loop. The reply is recorded in this module. There is no Bedrock call and no
 source read: a deploy can smoke this without a database or the discovery pack.
+`/api/health` is the same handler under the path the AWS deploy gate polls; see
+`_PLATFORM_HEALTH_PATH`.
 
 `wb serve` binds every interface and takes its port from `PORT` when `--port` is not
 given, because the deployed container is handed both by the platform. The image's
@@ -42,6 +44,20 @@ _DEFAULT_HOST = "0.0.0.0"  # noqa: S104 -- a container port is the deployed surf
 _DEFAULT_PORT = 8080
 _HOST_ENV = "WB_HOST"
 _PORT_ENV = "PORT"
+#: The path the AWS deploy gate polls, for every app, with no per-app override:
+#: `30-apps-infra/deploy/aws.sh:336` curls `${url}/api/health` and `:344` exits 3 on
+#: any non-200 under `DEPLOY_STRICT_HEALTH=1`, which `deploy/lambda/deployer.sh:139`
+#: always sets. A 404 here is not cosmetic -- it makes every AWS deploy record a
+#: failure, stops `last_hash` being written so the no-op skip never fires again, and
+#: eats the health deadline that `aws.sh:332` shares across all apps, so an existing
+#: app's cold start lands in `unhealthy` too. (`deploy/health.sh`, which tolerates a
+#: 404, runs only for Azure and Google Cloud.) Issue #36.
+#:
+#: Same bytes as `/healthz`, not a second implementation: one handler, two paths.
+_PLATFORM_HEALTH_PATH = "/api/health"
+#: Exact matches, both served by `health_body()`. Not a prefix test: `/api/health/x`
+#: and `/healthzz` are 404s like any other unknown path.
+_HEALTH_PATHS = frozenset({"/healthz", _PLATFORM_HEALTH_PATH})
 
 
 class Server(ThreadingHTTPServer):
@@ -262,7 +278,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _respond(self, *, include_body: bool) -> None:
         path = (getattr(self, "path", "") or "").split("?", 1)[0]
-        if path == "/healthz":
+        if path in _HEALTH_PATHS:
             status, body = health_body()
         elif path == "/":
             status, body = coverage_body()

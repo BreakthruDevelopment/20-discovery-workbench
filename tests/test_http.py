@@ -1,4 +1,4 @@
-"""`GET /healthz` and `GET /`."""
+"""`GET /healthz`, `GET /api/health` and `GET /`."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ import time
 import urllib.error
 import urllib.request
 from collections.abc import Iterator
+from pathlib import Path
 
 import pytest
 from agent_container.core.messages import ModelRequest, ModelResponse
@@ -129,6 +130,68 @@ def test_the_server_serves_health_and_the_map_and_hides_other_paths(
     assert head.status == 200
     assert head.read() == b""
     connection.close()
+
+
+def test_the_platform_health_path_serves_exactly_what_healthz_serves(
+    server: tuple[str, int], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`/api/health` is the path the AWS deploy gate polls (issue #36).
+
+    Both the status and the body are compared, not just "it answered 200": a second
+    handler that drifted from `/healthz` would still satisfy a health poll, and the
+    point of the alias is that there is one handler. The store and the source library
+    are made to raise here too -- the platform path must be as cheap as `/healthz`,
+    or a deploy gate that polls it every 10 seconds opens the database every time.
+    """
+
+    def boom(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("health must not touch the store or the sources")
+
+    monkeypatch.setattr(Store, "open", boom)
+    monkeypatch.setattr(SourceLibrary, "list_documents", boom)
+    monkeypatch.setattr(SourceLibrary, "read", boom)
+    monkeypatch.setattr(SourceLibrary, "for_engagement", boom)
+
+    host, port = server
+    answer = _get(host, port, http_mod._PLATFORM_HEALTH_PATH)
+    assert answer == (200, f"version: {__version__}\nreplay: ok\nstop_reason: end_turn\n")
+    assert _get(host, port, "/healthz") == answer
+
+    connection = http.client.HTTPConnection(host, port, timeout=5)
+    connection.request("HEAD", http_mod._PLATFORM_HEALTH_PATH)
+    head = connection.getresponse()
+    assert head.status == 200
+    assert head.read() == b""
+    connection.close()
+
+
+@pytest.mark.parametrize(
+    "near", ["/api", "/api/", "/api/health/", "/api/health/x", "/api/healthz", "/healthzz"]
+)
+def test_a_path_beside_the_health_paths_is_still_not_found(
+    server: tuple[str, int], near: str
+) -> None:
+    """The routes are exact matches. A prefix test would answer every /api/... path.
+
+    `/api/health/` is in the list on purpose: a trailing slash is the one neighbour a
+    health checker might send, and it must behave like any other unknown path rather
+    than like a third health route nothing pins.
+    """
+    host, port = server
+    assert _get(host, port, near) == (404, "not_found\n")
+
+
+def test_the_live_smoke_polls_the_path_the_deploy_gate_polls() -> None:
+    """`scripts/smoke.sh --url` is the live check after a deploy (issue #36).
+
+    It is not enough for the server to serve this path: the smoke has to poll it, or
+    the smoke passes while the deploy itself records a failure on the same URL. Read
+    out of the script against the constant, so moving either one fails here.
+    """
+    script = (Path(__file__).resolve().parents[1] / "scripts" / "smoke.sh").read_text(
+        encoding="utf-8"
+    )
+    assert f'"$base{http_mod._PLATFORM_HEALTH_PATH}"' in script
 
 
 def test_serve_rejects_a_port_outside_the_range(capsys: pytest.CaptureFixture[str]) -> None:

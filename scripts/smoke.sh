@@ -19,6 +19,14 @@ if [[ "${1:-}" == "--url" ]]; then
   grep -q '^version: 0\.1\.0$' <<<"$health"
   grep -q '^replay: ok$' <<<"$health"
   grep -q '^stop_reason: end_turn$' <<<"$health"
+  # The path the AWS deploy gate polls (30-apps-infra deploy/aws.sh, issue #36). Same
+  # handler as /healthz, so the bytes are compared rather than just the status: this is
+  # what catches the alias being routed somewhere else. `-f` makes a 404 fail the smoke.
+  platform_health=$(curl -fsS --max-time 30 "$base/api/health")
+  [[ "$platform_health" == "$health" ]] || {
+    echo "smoke: $base/api/health did not answer what /healthz answered" >&2
+    exit 1
+  }
   map=$(curl -fsS --max-time 30 "$base/")
   grep -q $'^1\.2\t' <<<"$map"
   grep -q $'^1\.3\t' <<<"$map"
