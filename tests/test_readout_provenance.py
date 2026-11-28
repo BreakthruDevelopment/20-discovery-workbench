@@ -29,7 +29,7 @@ from workbench.coordinator.providers import ReplaySource
 from workbench.core.config import SYNTHESIS_INPUT_CAP
 from workbench.core.principals import Principal
 from workbench.core.store import NewClaim, NewQuestion
-from workbench.readout.evidence import collect_evidence
+from workbench.readout.evidence import collect_evidence, coverage_document
 from workbench.readout.render import render_trace
 
 _CLERK = "interviews/ap-clerk.md"
@@ -130,3 +130,40 @@ def test_the_committed_run_labels_claims_in_store_order(
 
 def test_synthesis_uses_the_smaller_of_the_two_caps() -> None:
     assert min(SYNTHESIS_INPUT_CAP, MAX_USER_MESSAGE_CHARS) == MAX_USER_MESSAGE_CHARS
+
+
+def test_a_question_answered_with_no_verified_claim_is_a_named_gap(
+    fixture: Fixture, analyst: Principal
+) -> None:
+    """One question, one finding whose quote is absent from the document it names."""
+    refs = fixture.store.index_sources(analyst, ACME, fixture.acme_library)
+    doc_id = next(ref.doc_id for ref in refs if ref.path == _CLERK)
+    (question,) = fixture.store.record_questions(
+        analyst,
+        ACME,
+        [NewQuestion("How is matching done?", "process", [doc_id], "the clerk says so")],
+    )
+    fixture.store.record_subagent_run(
+        analyst, ACME, question_id=question.id, state="ok", turns=1, tokens=10
+    )
+    (claim,) = fixture.store.record_claims(
+        analyst,
+        ACME,
+        [NewClaim(question.id, "Matching is automatic.", doc_id, "this sentence is nowhere", 0.9)],
+        fixture.acme_library,
+    )
+    assert claim.verified is False
+
+    evidence = collect_evidence(fixture.store, fixture.config, analyst, ACME)
+    document = coverage_document(evidence.questions)
+    assert document["answered"] == 1
+    assert document["failed"] == 0
+    assert document["gaps"] == [
+        {
+            "question_id": question.id,
+            "reason": "subagent answered but no claim passed quote verification: "
+            "How is matching done?",
+        }
+    ]
+    # `finalise` refuses only over a failed run, on purpose: this gap is named, not a refusal.
+    assert fixture.store.failed_run_question_ids(analyst, ACME) == ()

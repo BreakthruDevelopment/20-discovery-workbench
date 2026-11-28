@@ -49,6 +49,9 @@ class QuestionView:
     seq: int
     text: str
     state: str | None
+    # Claims for this question that survived the quote re-check in `collect_evidence`, i.e. the
+    # ones synthesis may see. Required, so a caller cannot get "answered" by forgetting it.
+    verified_claims: int
     error_category: str | None = None
     is_retryable: bool = False
 
@@ -87,7 +90,7 @@ def collect_evidence(
             continue
         admitted.append(AdmittedClaim(label=f"C{len(admitted) + 1}", claim=claim))
 
-    questions = _questions(store, principal, engagement_id)
+    questions = _questions(store, principal, engagement_id, admitted)
     message, shown, omitted = build_message(
         questions,
         tuple(admitted),
@@ -169,10 +172,20 @@ def build_message(
 def coverage_document(questions: Sequence[QuestionView]) -> dict[str, object]:
     """Coverage from the recorded runs. The model's own coverage is not an input.
 
-    A gap is a question whose latest run failed, or a question with no run at all. That is the
-    same set `store.finalise` refuses to close over when the gap is a failed run, plus the
-    missing-run case the finalise guard also cannot see a success for. The committed discovery
-    recording has one failed run -- the throttled subagent -- and this is what names it.
+    A gap is a question whose latest run failed, a question with no run at all, or a question
+    whose latest run is `ok` but left no verified claim (every quote failed `verify_quote`, so
+    nothing from it reaches synthesis). The committed discovery recording has one failed run --
+    the throttled subagent -- and this is what names it; all four of its answered questions keep
+    at least one verified claim, so the third kind does not appear there.
+
+    **Decision (issue 17): `store.finalise` keeps refusing only over a `failed` run.** It does
+    not refuse over a no-run or a zero-claim gap. That asymmetry was already documented for the
+    no-run case; widening it would change when `wb finalise` refuses on recordings that exist
+    today, and `--accept-gaps` already exists for a lead who wants to proceed over a named gap.
+    The readout names every kind; finalise's refusal is the narrower rule on purpose.
+    A zero-claim question still counts as `answered` (its run state is `ok`); its gap entry is
+    what says it contributed nothing. An `insufficient_evidence` answer is not expressible
+    here: the store does not persist that flag.
     """
     gaps: list[dict[str, str]] = []
     answered = 0
@@ -180,6 +193,13 @@ def coverage_document(questions: Sequence[QuestionView]) -> dict[str, object]:
     for question in questions:
         if question.state == "ok":
             answered += 1
+            if question.verified_claims > 0:
+                continue
+            reason = (
+                "subagent answered but no claim passed quote verification: "
+                f"{one_line(question.text, limit=240)}"
+            )
+            gaps.append({"question_id": question.question_id, "reason": reason})
             continue
         if question.state == "failed":
             failed += 1
@@ -215,7 +235,15 @@ def _still_verbatim(
         return False
 
 
-def _questions(store: Store, principal: Principal, engagement_id: str) -> tuple[QuestionView, ...]:
+def _questions(
+    store: Store,
+    principal: Principal,
+    engagement_id: str,
+    admitted: Sequence[AdmittedClaim],
+) -> tuple[QuestionView, ...]:
+    verified: dict[str, int] = {}
+    for item in admitted:
+        verified[item.claim.question_id] = verified.get(item.claim.question_id, 0) + 1
     latest: dict[str, tuple[str, str | None, bool]] = {}
     for run in store.subagent_runs(principal, engagement_id):
         # Ordered by question sequence then insertion, so the last row for a question is the
@@ -230,6 +258,7 @@ def _questions(store: Store, principal: Principal, engagement_id: str) -> tuple[
                 seq=question.seq,
                 text=question.text,
                 state=state,
+                verified_claims=verified.get(question.id, 0),
                 error_category=error,
                 is_retryable=retryable,
             )

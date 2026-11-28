@@ -280,8 +280,14 @@ def test_a_final_readout_is_rendered_for_the_sponsor_without_calling_the_model(
 
     monkeypatch.setattr("workbench.cli.readout.synthesise", _boom)
     monkeypatch.setattr("workbench.cli.readout.LiveSource", _boom)
-    code, out = _run(["readout", ACME, *_who("sponsor-acme", "sponsor"), "--live"], capsys)
+    # A lead's `--live` on a final readout and a sponsor's plain read both get the stored
+    # readout. The model is never called for either: `synthesise` and `LiveSource` are trapped.
+    code, lead_out = _run(["readout", ACME, *_who("lead-parrott", "lead"), "--live"], capsys)
+    assert code == 0, lead_out
+    assert "readout: final" in lead_out
+    code, out = _run(["readout", ACME, *_who("sponsor-acme", "sponsor")], capsys)
     assert code == 0, out
+    assert out == lead_out
     assert "client: Acme Industrial" in out
     assert "readout: final" in out
     assert "coverage: 5 question(s), 4 answered, 1 failed" in out
@@ -312,3 +318,25 @@ def test_an_analyst_cannot_finalise_or_synthesise_live(
     assert "coverage:" not in live
     assert "Acme Industrial" not in live
     assert "invoice matching" not in live
+
+
+def test_a_sponsor_is_refused_live_on_a_final_readout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _configure(tmp_path, monkeypatch)
+    _discover(capsys)
+    code, _out = _run(["readout", ACME, *_who("analyst-rao", "analyst")], capsys)
+    assert code == 0
+    code, _accepted = _run(
+        ["finalise", ACME, *_who("lead-parrott", "lead"), "--accept-gaps"], capsys
+    )
+    assert code == 0
+
+    code, live = _run(["readout", ACME, *_who("sponsor-acme", "sponsor"), "--live"], capsys)
+    assert code == 1
+    assert "access_denied" in live
+    assert "category=permission" in live
+    assert "retryable=false" in live
+    assert "run_live" in live
+    assert "readout:" not in live
+    assert "Acme Industrial" not in live
