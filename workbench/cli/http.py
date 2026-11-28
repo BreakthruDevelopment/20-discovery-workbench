@@ -208,7 +208,10 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 class Handler(BaseHTTPRequestHandler):
-    """Two paths. Anything else is `not_found`, and the request path is not echoed."""
+    """Three paths, two bodies: `/healthz` and its `/api/health` alias, and `/`.
+
+    Anything else is `not_found`, and the request path is not echoed.
+    """
 
     server_version = "wb"
     sys_version = ""
