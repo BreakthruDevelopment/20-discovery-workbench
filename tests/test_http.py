@@ -5,11 +5,13 @@ from __future__ import annotations
 import http.client
 import json
 import socket
+import struct
 import threading
 import time
 import urllib.error
 import urllib.request
 from collections.abc import Iterator
+from typing import cast
 
 import pytest
 from agent_container.core.messages import ModelRequest, ModelResponse
@@ -188,6 +190,64 @@ def test_an_unparseable_request_line_is_not_echoed(server: tuple[str, int]) -> N
     response = _raw(host, port, b"BOGUS\xff CANARY2 JUNK\r\n\r\n")
     assert response.startswith(b"HTTP/1.1 400 ")
     assert b"CANARY2" not in response
+
+
+@pytest.mark.parametrize(("path", "route"), [("/healthz", "health_body"), ("/", "coverage_body")])
+def test_a_client_that_aborts_after_a_valid_request_leaves_no_traceback(
+    server: tuple[str, int],
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    path: str,
+    route: str,
+) -> None:
+    """Issue #23. The reset has to land before the first write, so the handler is held until it has.
+
+    Unheld, this is a race a slow link or an impatient health check loses regularly; held, it is
+    deterministic. Without the guard in `_send`, `socketserver` prints a ~24-line
+    `ConnectionResetError` traceback to stderr after the request's JSON line.
+    """
+    aborted = threading.Event()
+    handled = threading.Event()
+    held_in: list[threading.Thread] = []
+    real_route = getattr(http_mod, route)
+
+    def held() -> tuple[int, str]:
+        held_in.append(threading.current_thread())
+        aborted.wait(timeout=5)
+        return cast("tuple[int, str]", real_route())
+
+    real_shutdown = http_mod.Server.shutdown_request
+
+    def shutdown_request(self: http_mod.Server, request: socket.socket) -> None:
+        real_shutdown(self, request)
+        # Only the aborted request's thread counts: the fixture's readiness probe is
+        # another connection, and it can finish after this patch is in place.
+        if threading.current_thread() in held_in:
+            handled.set()
+
+    monkeypatch.setattr(http_mod, route, held)
+    monkeypatch.setattr(http_mod.Server, "shutdown_request", shutdown_request)
+
+    host, port = server
+    capsys.readouterr()
+    client = socket.create_connection((host, port), timeout=5)
+    client.sendall(f"GET {path} HTTP/1.1\r\nHost: wb\r\n\r\n".encode("ascii"))
+    time.sleep(0.1)  # the server has read the request and is inside the held route
+    # SO_LINGER on with a zero timeout: close() sends RST instead of FIN.
+    client.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+    client.close()
+    time.sleep(0.1)  # the RST has arrived before the handler writes a byte
+    aborted.set()
+    assert handled.wait(timeout=5), "the server never finished the aborted request"
+
+    captured = capsys.readouterr()
+    lines = [line for line in captured.err.splitlines() if line.strip()]
+    for line in lines:
+        json.loads(line)  # every stderr line is a JSON log line; a traceback line is not
+    assert "Traceback" not in captured.err
+    # `send_response` logs before the first write fails, so the request still has its line.
+    assert len(lines) == 1
+    assert json.loads(lines[0]) == {"event": "http", "method": "GET", "path": path, "status": 200}
 
 
 def test_an_unsupported_method_is_not_echoed(server: tuple[str, int]) -> None:
