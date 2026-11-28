@@ -19,6 +19,11 @@ if [[ "${1:-}" == "--url" ]]; then
   grep -q '^version: 0\.1\.0$' <<<"$health"
   grep -q '^replay: ok$' <<<"$health"
   grep -q '^stop_reason: end_turn$' <<<"$health"
+  # /api/health too: that is the path deploy/aws.sh curls after the deploy, and it exits 3
+  # on any non-200 under DEPLOY_STRICT_HEALTH=1. Checking only /healthz would leave the
+  # live smoke green while the gate the deployer actually runs was failing.
+  alias_health=$(curl -fsS --max-time 30 "$base/api/health")
+  [[ "$alias_health" == "$health" ]]
   map=$(curl -fsS --max-time 30 "$base/")
   grep -q $'^1\.2\t' <<<"$map"
   grep -q $'^1\.3\t' <<<"$map"
