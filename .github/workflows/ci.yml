@@ -126,6 +126,9 @@ jobs:
           health=$(curl -fsS --max-time 10 http://127.0.0.1:8080/healthz)
           grep -q "^version: 0.1.0$" <<<"$health"
           grep -q "^replay: ok$" <<<"$health"
+          # The platform health path, in the image. deploy/aws.sh curls this one, not /healthz.
+          alias_health=$(curl -fsS --max-time 10 http://127.0.0.1:8080/api/health)
+          [ "$alias_health" = "$health" ]
           map=$(curl -fsS --max-time 10 http://127.0.0.1:8080/)
           grep -q $'^5\.6\t' <<<"$map"
           # Still running after being served, i.e. serve_forever rather than one reply and exit.

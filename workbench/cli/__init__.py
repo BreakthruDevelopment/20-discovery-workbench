@@ -79,10 +79,11 @@ def build_parser() -> argparse.ArgumentParser:
     http.add_arguments(
         sub.add_parser(
             "serve",
-            help="serve GET /healthz and GET /",
+            help="serve GET /healthz (and its /api/health alias) and GET /",
             description=(
-                "Serve the version and a replay round-trip at /healthz, and the static "
-                "exam-coverage map at /."
+                "Serve the version and a replay round-trip at /healthz, also reachable at "
+                "/api/health because that is the path the platform health-checks, and the "
+                "static exam-coverage map at /."
             ),
         )
     )

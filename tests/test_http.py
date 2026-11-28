@@ -324,3 +324,48 @@ def test_a_malformed_port_variable_does_not_break_the_rest_of_the_cli(
         main(["--version"])
     assert caught.value.code == 0
     assert capsys.readouterr().out == f"wb {__version__}\n"
+
+
+def test_the_platform_health_path_is_an_alias_of_healthz(server: tuple[str, int]) -> None:
+    """`/api/health` is what the deploy gate curls for every app on this stack.
+
+    `deploy/aws.sh` exits 3 on any non-200 there when `DEPLOY_STRICT_HEALTH=1`, which the
+    deployer Lambda sets -- and that failure also stops `last_sha`/`last_hash` advancing in
+    `deployer.sh`, so a 404 on this path wedges the deployer for every AWS app, not only
+    this one. Hence an alias rather than a 404.
+    """
+    host, port = server
+    alias = urllib.request.urlopen(f"http://{host}:{port}/api/health", timeout=5)
+    healthz = urllib.request.urlopen(f"http://{host}:{port}/healthz", timeout=5)
+    assert alias.status == 200
+    body = alias.read().decode()
+    # The same body, not merely another 200: a stub that always answered ok would pass a
+    # status-only check while reporting nothing about the replay round-trip.
+    assert body == healthz.read().decode()
+    assert f"version: {__version__}\n" in body
+    assert "replay: ok\n" in body
+
+
+def test_the_platform_health_path_reports_a_failure_like_healthz_does(
+    server: tuple[str, int], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The alias must be able to go unhealthy, or it is a gate that cannot fail.
+
+    A deploy gate wired to a path that always answers 200 is worse than no gate: it would
+    pass a container whose replay round-trip is broken.
+    """
+    monkeypatch.setattr(http_mod, "replay_round_trip", lambda *a, **k: (False, "none"))
+    with pytest.raises(urllib.error.HTTPError) as caught:
+        urllib.request.urlopen(f"http://{server[0]}:{server[1]}/api/health", timeout=5)
+    assert caught.value.code == 500
+
+
+def test_a_path_under_the_platform_health_prefix_is_still_not_found(
+    server: tuple[str, int],
+) -> None:
+    """Only the exact path, so the alias does not open a prefix match."""
+    host, port = server
+    for path in ("/api/health/", "/api/health/extra", "/api", "/api/healthz"):
+        with pytest.raises(urllib.error.HTTPError) as caught:
+            urllib.request.urlopen(f"http://{host}:{port}{path}", timeout=5)
+        assert caught.value.code == 404, path

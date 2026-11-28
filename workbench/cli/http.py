@@ -4,6 +4,9 @@
 loop. The reply is recorded in this module. There is no Bedrock call and no
 source read: a deploy can smoke this without a database or the discovery pack.
 
+`GET /api/health` is an alias of `/healthz`, because that is the path the platform
+health-checks every app on. It is not a second implementation: both call `health_body()`.
+
 `wb serve` binds every interface and takes its port from `PORT` when `--port` is not
 given, because the deployed container is handed both by the platform. The image's
 default command is `serve`, and `tests/test_image.py` is what fails if that changes.
@@ -40,6 +43,12 @@ _TEXT = "text/plain; charset=utf-8"
 #: The container has no loopback client, so an unset host binds every interface.
 _DEFAULT_HOST = "0.0.0.0"  # noqa: S104 -- a container port is the deployed surface
 _DEFAULT_PORT = 8080
+#: The path every app on the 30-apps stack is health-checked on. `deploy/aws.sh` curls it
+#: after the deploy and exits 3 on any non-200 under DEPLOY_STRICT_HEALTH=1, which the
+#: deployer Lambda sets -- and that failure also stops `last_sha`/`last_hash` advancing, so
+#: a 404 here wedges the deployer for every AWS app, not just this one. Served as an alias
+#: of /healthz rather than a second implementation.
+_PLATFORM_HEALTH = "/api/health"
 _HOST_ENV = "WB_HOST"
 _PORT_ENV = "PORT"
 
@@ -199,7 +208,10 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 class Handler(BaseHTTPRequestHandler):
-    """Two paths. Anything else is `not_found`, and the request path is not echoed."""
+    """Three paths, two bodies: `/healthz` and its `/api/health` alias, and `/`.
+
+    Anything else is `not_found`, and the request path is not echoed.
+    """
 
     server_version = "wb"
     sys_version = ""
@@ -262,7 +274,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _respond(self, *, include_body: bool) -> None:
         path = (getattr(self, "path", "") or "").split("?", 1)[0]
-        if path == "/healthz":
+        if path in ("/healthz", _PLATFORM_HEALTH):
             status, body = health_body()
         elif path == "/":
             status, body = coverage_body()
