@@ -2,9 +2,7 @@
 
 > A consultancy gets an ambiguous brief ("we spend too much on procure-to-pay, do something with AI") and a pile of evidence. The partner needs a readout a client executive will sign. That readout says where the client is, which outcomes are worth chasing and in what order, and **which claims nothing in the evidence supports**.
 
-<!-- DRAFT: placeholders below are marked TODO(deploy). Fill them in after 30-apps-infra#99 (20.7) is live. -->
-
-**Live:** TODO(deploy): `https://app20.breakthruventures.ai/healthz` once 30-apps-infra#99 is applied and the live smoke passes. · **Runs on:** AWS · **Imports:** [app 17](https://github.com/BreakthruDevelopment/17-agent-container), pinned by tag in [`pyproject.toml`](pyproject.toml). Nothing is imported from apps 18 or 19. · Part of [30 apps in 30 days](https://github.com/BreakthruDevelopment/ai-dev-os): the **discover** stage of the AWS demo track (apps 17 to 20).
+**Live:** https://app20.breakthruventures.ai — `GET /healthz` and `GET /` · **Runs on:** AWS · **Imports:** [app 17](https://github.com/BreakthruDevelopment/17-agent-container), pinned by tag in [`pyproject.toml`](pyproject.toml). Nothing is imported from apps 18 or 19. · Part of [30 apps in 30 days](https://github.com/BreakthruDevelopment/ai-dev-os): the **discover** stage of the AWS demo track (apps 17 to 20).
 
 There is no web UI. The demo is the `wb` command line. The live surface is two read-only endpoints: `GET /healthz` and `GET /`, which serves the exam-coverage map.
 
@@ -90,7 +88,32 @@ Every store accessor calls [`assert_can`](workbench/core/principals.py#L144), wh
 
 ## Deploy it yourself
 
-TODO(deploy): fill this in from 30-apps-infra#99 (20.7) once it merges: the `apps.yaml` entry, the runtime and the IAM policy the deploy uses. The Lambda packaging is still open as PR #30. The image is built from the [`Dockerfile`](Dockerfile), serves `wb serve` on `$PORT` (default 8080), and is published by [`publish.yml`](.github/workflows/publish.yml). After a deploy, run `scripts/smoke.sh --url https://app20.breakthruventures.ai` to check `/healthz` and `/`.
+The whole deploy is one entry in [`apps.yaml`](https://github.com/BreakthruDevelopment/30-apps-infra/blob/main/apps.yaml) in `30-apps-infra`:
+
+```yaml
+  - name: discovery-workbench
+    title: Discovery Workbench
+    clouds: [aws]
+    image: ghcr.io/breakthrudevelopment/20-discovery-workbench
+    tag: sha-d5358ad
+    domain: app20.breakthruventures.ai
+    ai: demo
+```
+
+Merging that entry *is* the deploy. An EventBridge schedule runs the `apps30-deployer` Lambda every 10 minutes; it pulls `main` of `30-apps-infra` and applies it, so no step runs on a developer's machine and nothing in GitHub holds an AWS credential. The image itself is built from the [`Dockerfile`](Dockerfile) and published to GHCR by [`publish.yml`](.github/workflows/publish.yml); `tag` is always an immutable `sha-<commit>`, never `latest`, so a deploy is repeatable.
+
+**Runtime.** The shared AWS stack ([`stacks/aws/main.tf`](https://github.com/BreakthruDevelopment/30-apps-infra/blob/main/stacks/aws/main.tf)) runs each app as a `package_type = "Image"` Lambda function on **arm64**, 1024 MB, with a 29-second timeout, behind an API Gateway HTTP API mapped to the custom domain. Cloudflare DNS records are created by Terraform on deploy; nobody adds them by hand.
+
+Two settings in that stack are why the [`Dockerfile`](Dockerfile) looks the way it does, and both are worth knowing before changing it:
+
+- It sets `AWS_LWA_PORT=3000` for every app and sets no `PORT`, so the port has to come from the image: this one sets `PORT=3000`, which `wb serve` reads. `wb serve`'s own default stays 8080 for a local run. The image also ships the [AWS Lambda Web Adapter](https://github.com/awslabs/aws-lambda-web-adapter) 0.9.1 as a Lambda extension, which is what lets a plain HTTP server answer Lambda invocations; it is inert under `docker run`. Without it the function fails init on every invoke ([#29](https://github.com/BreakthruDevelopment/20-discovery-workbench/issues/29)).
+- It sets `AWS_LWA_READINESS_CHECK_PATH=/`, which this app answers with the coverage map.
+
+**IAM.** The function's role attaches exactly one policy, the managed `AWSLambdaBasicExecutionRole` (CloudWatch Logs, 7-day retention). Nothing grants it access to any other AWS service. The image bakes in no credentials and runs as a non-root user.
+
+**What is deliberately not deployed.** The store is a SQLite file ([`store.py`](workbench/core/store.py)) and a Lambda's filesystem does not outlive an invoke, so the deployed surface is the two read-only endpoints and nothing else: no engagement is created, read or finalised over HTTP. The shared stack hands every app a Postgres `DATABASE_URL` and a `BETTER_AUTH_SECRET`; this app uses neither. The workbench itself is the `wb` command line, run against a local store.
+
+After a deploy, `scripts/smoke.sh --url https://app20.breakthruventures.ai` checks `/healthz` and `/`.
 
 ## Develop
 
@@ -113,4 +136,4 @@ See [`AGENTS.md`](AGENTS.md) for the repo rules.
 5. Under `maturity:`, find `exception handling: level unknown` with `claims: none`. No verified claim means no number.
 6. Under `trace:`, claim `id-0007` is `verified: false`: "the quote is not present verbatim in the document it names". The fabricated quote never reached the readout.
 7. Under `finalise:`, the first attempt is refused (`coverage_gaps_present`). The second, with `accept_gaps: true`, is recorded as `finalised_by: lead-parrott`.
-8. TODO(deploy): open `https://app20.breakthruventures.ai/healthz` (version and `replay: ok`), then `/` for the exam-coverage map.
+8. Open [`https://app20.breakthruventures.ai/healthz`](https://app20.breakthruventures.ai/healthz) — the package version and `replay: ok`, which is one recorded round-trip through app 17's loop — then [`/`](https://app20.breakthruventures.ai/) for the exam-coverage map, the same four statements as the table above.
