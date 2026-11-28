@@ -61,7 +61,7 @@ _HEALTH_PATHS = frozenset({"/healthz", _PLATFORM_HEALTH_PATH})
 
 
 class Server(ThreadingHTTPServer):
-    """The two-route server. Threads are daemons so a test can shut it down."""
+    """The server. Threads are daemons so a test can shut it down."""
 
     allow_reuse_address = True
     daemon_threads = True
@@ -215,7 +215,8 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 class Handler(BaseHTTPRequestHandler):
-    """Two paths. Anything else is `not_found`, and the request path is not echoed."""
+    """Two handlers over three paths (`/api/health` is `/healthz`'s). Anything else is
+    `not_found`, and the request path is not echoed."""
 
     server_version = "wb"
     sys_version = ""

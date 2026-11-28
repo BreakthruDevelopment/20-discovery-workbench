@@ -181,17 +181,37 @@ def test_a_path_beside_the_health_paths_is_still_not_found(
     assert _get(host, port, near) == (404, "not_found\n")
 
 
+def test_the_health_path_the_deploy_gate_polls_is_the_literal_it_polls() -> None:
+    """The literal, not the constant. `30-apps-infra/deploy/aws.sh:336` curls this exact
+    path for every app and has no per-app override, so the value is a contract with
+    another repo rather than a choice this repo gets to make. Asserting the constant
+    against itself -- which is what the assertions above do, deliberately, so that they
+    read as being about the route -- holds for whatever the constant says. Same reason
+    the unset-host test below writes `"0.0.0.0"` out in full.
+    """
+    assert http_mod._PLATFORM_HEALTH_PATH == "/api/health"
+    assert frozenset({"/healthz", "/api/health"}) == http_mod._HEALTH_PATHS
+
+
 def test_the_live_smoke_polls_the_path_the_deploy_gate_polls() -> None:
     """`scripts/smoke.sh --url` is the live check after a deploy (issue #36).
 
     It is not enough for the server to serve this path: the smoke has to poll it, or
-    the smoke passes while the deploy itself records a failure on the same URL. Read
-    out of the script against the constant, so moving either one fails here.
+    the smoke passes while the deploy itself records a failure on the same URL.
+
+    Comment lines are dropped first and the whole invocation is matched: this change
+    puts a comment block directly above the poll that names the path, so a substring
+    search over the raw file would be satisfied by that comment alone with the poll
+    moved elsewhere -- a test that cannot fail for the reason it exists.
     """
     script = (Path(__file__).resolve().parents[1] / "scripts" / "smoke.sh").read_text(
         encoding="utf-8"
     )
-    assert f'"$base{http_mod._PLATFORM_HEALTH_PATH}"' in script
+    live = [line.strip() for line in script.splitlines() if not line.strip().startswith("#")]
+    assert (
+        f'platform_health=$(curl -fsS --max-time 30 "$base{http_mod._PLATFORM_HEALTH_PATH}")'
+        in live
+    )
 
 
 def test_serve_rejects_a_port_outside_the_range(capsys: pytest.CaptureFixture[str]) -> None:

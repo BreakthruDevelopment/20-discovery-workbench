@@ -111,7 +111,7 @@ jobs:
         # This job is the only place the container itself is exercised; it was written without a
         # Docker daemon available, so the image half is proven by this job's own first green run
         # and not by a local one. What WAS measured locally, on the installed CLI: `wb serve`
-        # with no arguments prints `listening: http://0.0.0.0:8080/` and answers both routes,
+        # with no arguments prints `listening: http://0.0.0.0:8080/` and answers every route,
         # `PORT=9123 wb serve` listens on 9123, and `scripts/smoke.sh --url` passes against it.
         # `tests/test_image.py` pins the Dockerfile directives those two facts combine with.
         run: |
@@ -126,6 +126,13 @@ jobs:
           health=$(curl -fsS --max-time 10 http://127.0.0.1:8080/healthz)
           grep -q "^version: 0.1.0$" <<<"$health"
           grep -q "^replay: ok$" <<<"$health"
+          # /api/health is the path the AWS deploy gate curls (issue #36), and it curls THIS
+          # IMAGE, not the installed CLI. Everything else covering the alias runs in-process
+          # in pytest, so this is the only pre-merge proof that the deployed artifact answers
+          # it. `-f` makes a 404 fail the step; the bytes are compared rather than the status
+          # because the alias is meant to be the same handler, not merely something that 200s.
+          gate=$(curl -fsS --max-time 10 http://127.0.0.1:8080/api/health)
+          test "$gate" = "$health"
           map=$(curl -fsS --max-time 10 http://127.0.0.1:8080/)
           grep -q $'^5\.6\t' <<<"$map"
           # Still running after being served, i.e. serve_forever rather than one reply and exit.

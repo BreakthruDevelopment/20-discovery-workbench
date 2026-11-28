@@ -45,7 +45,8 @@ RUN set -eu; \
       echo "adapter check: ELF e_machine $got, expected $want" >&2; exit 1; \
     fi
 USER app
-# The deployed surface is `wb serve` (GET /healthz, GET /), so the image serves with no
+# The deployed surface is `wb serve` (GET /healthz, GET /api/health, GET /), so the image
+# serves with no
 # arguments. `--version` stays reachable by overriding the command -- which is what ci.yml's
 # `Container image` job does -- but it must not be the default: a container that prints one
 # line and exits is health-checked and restarted forever.
