@@ -75,6 +75,9 @@ def _coverage_lines(coverage: object) -> list[str]:
             f"  GAP {safe_token(question_id if isinstance(question_id, str) else '', limit=64)}: "
             f"{one_line(reason if isinstance(reason, str) else '', limit=400)}"
         )
+    omitted = _count(section.get("gaps_omitted"))
+    if omitted:
+        lines.append(f"  {omitted} further gap(s) not listed here")
     return lines
 
 
