@@ -120,6 +120,16 @@ class ReplaySource:
         return recorded.provider()
 
 
+def require_live(principal: Principal, engagement_id: str, state: EngagementState) -> None:
+    """The `--live` rule, in one place: refuse anyone who may not `RUN_LIVE` here.
+
+    `LiveSource` calls this first. A caller that has to refuse `--live` without building a
+    `LiveSource` (a stored readout needs no provider at all) calls the same function, so there
+    is one rule and not a second copy that could drift.
+    """
+    assert_can(principal, Action.RUN_LIVE, Resource(engagement_id, state))
+
+
 class LiveSource:
     """Bedrock behind app 17's rate limiter. Reached only by an explicit, `lead`-only `--live`.
 
@@ -136,7 +146,7 @@ class LiveSource:
         # The check first, the import second: an unauthorised `--live` must not so much as load
         # boto3, let alone build a client. (`AccessDenied` from here is also what keeps the
         # refusal in the one object that can reach the network, rather than in a caller.)
-        assert_can(principal, Action.RUN_LIVE, Resource(engagement_id, state))
+        require_live(principal, engagement_id, state)
 
         from agent_container.core.bedrock import BedrockProvider
 

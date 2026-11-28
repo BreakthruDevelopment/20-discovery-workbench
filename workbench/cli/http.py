@@ -4,6 +4,9 @@
 loop. The reply is recorded in this module. There is no Bedrock call and no
 source read: a deploy can smoke this without a database or the discovery pack.
 
+`GET /api/health` is an alias of `/healthz`, because that is the path the platform
+health-checks every app on. It is not a second implementation: both call `health_body()`.
+
 `wb serve` binds every interface and takes its port from `PORT` when `--port` is not
 given, because the deployed container is handed both by the platform. The image's
 default command is `serve`, and `tests/test_image.py` is what fails if that changes.
@@ -40,6 +43,12 @@ _TEXT = "text/plain; charset=utf-8"
 #: The container has no loopback client, so an unset host binds every interface.
 _DEFAULT_HOST = "0.0.0.0"  # noqa: S104 -- a container port is the deployed surface
 _DEFAULT_PORT = 8080
+#: The path every app on the 30-apps stack is health-checked on. `deploy/aws.sh` curls it
+#: after the deploy and exits 3 on any non-200 under DEPLOY_STRICT_HEALTH=1, which the
+#: deployer Lambda sets -- and that failure also stops `last_sha`/`last_hash` advancing, so
+#: a 404 here wedges the deployer for every AWS app, not just this one. Served as an alias
+#: of /healthz rather than a second implementation.
+_PLATFORM_HEALTH = "/api/health"
 _HOST_ENV = "WB_HOST"
 _PORT_ENV = "PORT"
 
@@ -167,7 +176,11 @@ def run(args: argparse.Namespace) -> int:
         return 1
     try:
         server = bind(host, port)
-    except OSError:
+    # Not only `OSError`: `socket.bind` raises `TypeError` for a host it cannot encode -- a lone
+    # surrogate, which is how Python decodes an invalid UTF-8 byte in argv or `WB_HOST`, or a
+    # NUL -- and `ValueError` (which includes `UnicodeError`) from the IDNA codec. Each would
+    # otherwise exit with a traceback on a user-supplied value instead of this fixed code.
+    except (OSError, TypeError, ValueError):
         print("invalid_input: the address could not be bound")
         return 1
     raw_host, raw_port = server.server_address[:2]
@@ -199,7 +212,10 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 class Handler(BaseHTTPRequestHandler):
-    """Two paths. Anything else is `not_found`, and the request path is not echoed."""
+    """Three paths, two bodies: `/healthz` and its `/api/health` alias, and `/`.
+
+    Anything else is `not_found`, and the request path is not echoed.
+    """
 
     server_version = "wb"
     sys_version = ""
@@ -262,7 +278,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _respond(self, *, include_body: bool) -> None:
         path = (getattr(self, "path", "") or "").split("?", 1)[0]
-        if path == "/healthz":
+        if path in ("/healthz", _PLATFORM_HEALTH):
             status, body = health_body()
         elif path == "/":
             status, body = coverage_body()
@@ -271,16 +287,27 @@ class Handler(BaseHTTPRequestHandler):
         self._send(status, body, include_body=include_body)
 
     def _send(self, status: int, body: str, *, include_body: bool) -> None:
-        """The one writer. Nothing derived from the request reaches a header or a body."""
+        """The one writer. Nothing derived from the request reaches a header or a body.
+
+        The writes are guarded the same way `_send_unparsed`'s is: a client that sends a valid
+        request and then aborts (`SO_LINGER 0`, an impatient health check) makes the header
+        flush in `end_headers` or the body write raise `ConnectionResetError`. Unguarded, that
+        reached `socketserver`'s `handle_error`, which printed a traceback -- server file paths
+        included -- beside the request's JSON line. `send_response` has already logged the
+        request by then, so it stays exactly one JSON line.
+        """
         data = body.encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", _TEXT)
-        self.send_header("Content-Length", str(len(data)))
-        self.send_header("Connection", "close")
-        self.end_headers()
         self.close_connection = True
-        if include_body:
-            self.wfile.write(data)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", _TEXT)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            if include_body:
+                self.wfile.write(data)
+        except OSError:
+            return
 
     def log_request(self, code: int | str = "-", size: int | str = "-") -> None:
         del size

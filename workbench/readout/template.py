@@ -265,11 +265,13 @@ class ReadoutTemplate(metaclass=_SkeletonMeta):
                 if not safe_id:
                     continue
                 gaps.append({"question_id": safe_id, "reason": one_line(reason, limit=400)})
+        omitted = document["gaps_omitted"]
         return {
             "questions_total": document["questions_total"],
             "answered": document["answered"],
             "failed": document["failed"],
             "gaps": gaps,
+            "gaps_omitted": omitted if isinstance(omitted, int) and omitted > 0 else 0,
         }
 
 

@@ -5,11 +5,13 @@ from __future__ import annotations
 import http.client
 import json
 import socket
+import struct
 import threading
 import time
 import urllib.error
 import urllib.request
 from collections.abc import Iterator
+from typing import cast
 
 import pytest
 from agent_container.core.messages import ModelRequest, ModelResponse
@@ -138,6 +140,34 @@ def test_serve_rejects_a_port_outside_the_range(capsys: pytest.CaptureFixture[st
     assert "70000" not in captured.out
 
 
+@pytest.mark.parametrize(
+    "bad",
+    [
+        # `wb serve --host $'ho\xffst'`: Python decodes the invalid UTF-8 byte in argv as the
+        # lone surrogate U+DCFF, which `socket.bind` cannot encode (`TypeError`).
+        "ho\udcffst",
+        "ho\x00st",
+    ],
+)
+def test_a_host_the_socket_cannot_encode_exits_with_the_fixed_code(
+    capsys: pytest.CaptureFixture[str], bad: str
+) -> None:
+    """Issue #27. `bind` raised `TypeError`, which `except OSError` let through as a traceback."""
+    assert main(["serve", "--host", bad, "--port", "0"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == "invalid_input: the address could not be bound\n"
+    assert captured.err == ""
+
+
+def test_an_unencodable_host_variable_exits_with_the_fixed_code(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`WB_HOST` reaches the same `bind` call, so the same byte there must fail the same way."""
+    monkeypatch.setenv("WB_HOST", "ho\udcffst")
+    assert main(["serve", "--port", "0"]) == 1
+    assert capsys.readouterr().out == "invalid_input: the address could not be bound\n"
+
+
 def _raw(host: str, port: int, request: bytes, *, timeout: float = 5.0) -> bytes:
     """One raw request on a socket. `http.client` will not send a malformed request line."""
     with socket.create_connection((host, port), timeout=timeout) as sock:
@@ -188,6 +218,64 @@ def test_an_unparseable_request_line_is_not_echoed(server: tuple[str, int]) -> N
     response = _raw(host, port, b"BOGUS\xff CANARY2 JUNK\r\n\r\n")
     assert response.startswith(b"HTTP/1.1 400 ")
     assert b"CANARY2" not in response
+
+
+@pytest.mark.parametrize(("path", "route"), [("/healthz", "health_body"), ("/", "coverage_body")])
+def test_a_client_that_aborts_after_a_valid_request_leaves_no_traceback(
+    server: tuple[str, int],
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    path: str,
+    route: str,
+) -> None:
+    """Issue #23. The reset has to land before the first write, so the handler is held until it has.
+
+    Unheld, this is a race a slow link or an impatient health check loses regularly; held, it is
+    deterministic. Without the guard in `_send`, `socketserver` prints a ~24-line
+    `ConnectionResetError` traceback to stderr after the request's JSON line.
+    """
+    aborted = threading.Event()
+    handled = threading.Event()
+    held_in: list[threading.Thread] = []
+    real_route = getattr(http_mod, route)
+
+    def held() -> tuple[int, str]:
+        held_in.append(threading.current_thread())
+        aborted.wait(timeout=5)
+        return cast("tuple[int, str]", real_route())
+
+    real_shutdown = http_mod.Server.shutdown_request
+
+    def shutdown_request(self: http_mod.Server, request: socket.socket) -> None:
+        real_shutdown(self, request)
+        # Only the aborted request's thread counts: the fixture's readiness probe is
+        # another connection, and it can finish after this patch is in place.
+        if threading.current_thread() in held_in:
+            handled.set()
+
+    monkeypatch.setattr(http_mod, route, held)
+    monkeypatch.setattr(http_mod.Server, "shutdown_request", shutdown_request)
+
+    host, port = server
+    capsys.readouterr()
+    client = socket.create_connection((host, port), timeout=5)
+    client.sendall(f"GET {path} HTTP/1.1\r\nHost: wb\r\n\r\n".encode("ascii"))
+    time.sleep(0.1)  # the server has read the request and is inside the held route
+    # SO_LINGER on with a zero timeout: close() sends RST instead of FIN.
+    client.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+    client.close()
+    time.sleep(0.1)  # the RST has arrived before the handler writes a byte
+    aborted.set()
+    assert handled.wait(timeout=5), "the server never finished the aborted request"
+
+    captured = capsys.readouterr()
+    lines = [line for line in captured.err.splitlines() if line.strip()]
+    for line in lines:
+        json.loads(line)  # every stderr line is a JSON log line; a traceback line is not
+    assert "Traceback" not in captured.err
+    # `send_response` logs before the first write fails, so the request still has its line.
+    assert len(lines) == 1
+    assert json.loads(lines[0]) == {"event": "http", "method": "GET", "path": path, "status": 200}
 
 
 def test_an_unsupported_method_is_not_echoed(server: tuple[str, int]) -> None:
@@ -280,17 +368,22 @@ def test_a_blank_port_variable_falls_back_rather_than_failing() -> None:
     assert http_mod.resolve_port(None, {"PORT": "  "}) == 8080
 
 
-@pytest.mark.parametrize("bad", ["eight", "80 80", "8080.0", "0x1f90", "٨٠٨٠"])
-def test_a_malformed_port_variable_is_refused_and_not_echoed(bad: str) -> None:
+#: `PORT` values that must be refused. `٨٠٨٠` is Arabic-Indic digits, which `int()` accepts and
+#: a port parser must not: the platform wrote `PORT` as ASCII or it meant something else.
+MALFORMED_PORTS = ["eight", "80 80", "8080.0", "0x1f90", "٨٠٨٠", "not-a-port"]
+
+
+@pytest.mark.parametrize("bad", MALFORMED_PORTS)
+def test_a_malformed_port_variable_is_refused(bad: str) -> None:
     """Falling back to 8080 would bind somewhere the platform is not health-checking.
 
-    `٨٠٨٠` is Arabic-Indic digits, which `int()` accepts and a port parser must not:
-    the platform wrote `PORT` as ASCII or it meant something else.
+    This pins the refusal and its fixed code. It is not the no-echo guard: once `code` equals
+    a fixed string, `bad not in code` holds by construction and cannot fail on its own (issue
+    #28). `test_serve_refuses_a_malformed_port_variable` below is the guard.
     """
     with pytest.raises(http_mod.ConfigError) as caught:
         http_mod.resolve_port(None, {"PORT": bad})
     assert caught.value.code == "invalid_input: PORT is not a number"
-    assert bad not in caught.value.code
 
 
 @pytest.mark.parametrize("bad", ["70000", "-1", "65536"])
@@ -300,14 +393,21 @@ def test_a_port_variable_outside_the_range_is_refused(bad: str) -> None:
     assert caught.value.code == "invalid_input: a port is between 0 and 65535"
 
 
+@pytest.mark.parametrize("bad", MALFORMED_PORTS)
 def test_serve_refuses_a_malformed_port_variable(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], bad: str
 ) -> None:
-    monkeypatch.setenv("PORT", "not-a-port")
+    """The no-echo guard: the whole of what `wb serve` prints, compared exactly.
+
+    Exact equality is the assertion that fails if the raw value is ever interpolated into the
+    message, whether into the code itself or around it; a `bad not in out` line beside it
+    would be implied and could not fail on its own, so there is none (issue #28).
+    """
+    monkeypatch.setenv("PORT", bad)
     assert main(["serve"]) == 1
     captured = capsys.readouterr()
     assert captured.out == "invalid_input: PORT is not a number\n"
-    assert "not-a-port" not in captured.out
+    assert captured.err == ""
 
 
 def test_a_malformed_port_variable_does_not_break_the_rest_of_the_cli(
@@ -324,3 +424,48 @@ def test_a_malformed_port_variable_does_not_break_the_rest_of_the_cli(
         main(["--version"])
     assert caught.value.code == 0
     assert capsys.readouterr().out == f"wb {__version__}\n"
+
+
+def test_the_platform_health_path_is_an_alias_of_healthz(server: tuple[str, int]) -> None:
+    """`/api/health` is what the deploy gate curls for every app on this stack.
+
+    `deploy/aws.sh` exits 3 on any non-200 there when `DEPLOY_STRICT_HEALTH=1`, which the
+    deployer Lambda sets -- and that failure also stops `last_sha`/`last_hash` advancing in
+    `deployer.sh`, so a 404 on this path wedges the deployer for every AWS app, not only
+    this one. Hence an alias rather than a 404.
+    """
+    host, port = server
+    alias = urllib.request.urlopen(f"http://{host}:{port}/api/health", timeout=5)
+    healthz = urllib.request.urlopen(f"http://{host}:{port}/healthz", timeout=5)
+    assert alias.status == 200
+    body = alias.read().decode()
+    # The same body, not merely another 200: a stub that always answered ok would pass a
+    # status-only check while reporting nothing about the replay round-trip.
+    assert body == healthz.read().decode()
+    assert f"version: {__version__}\n" in body
+    assert "replay: ok\n" in body
+
+
+def test_the_platform_health_path_reports_a_failure_like_healthz_does(
+    server: tuple[str, int], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The alias must be able to go unhealthy, or it is a gate that cannot fail.
+
+    A deploy gate wired to a path that always answers 200 is worse than no gate: it would
+    pass a container whose replay round-trip is broken.
+    """
+    monkeypatch.setattr(http_mod, "replay_round_trip", lambda *a, **k: (False, "none"))
+    with pytest.raises(urllib.error.HTTPError) as caught:
+        urllib.request.urlopen(f"http://{server[0]}:{server[1]}/api/health", timeout=5)
+    assert caught.value.code == 500
+
+
+def test_a_path_under_the_platform_health_prefix_is_still_not_found(
+    server: tuple[str, int],
+) -> None:
+    """Only the exact path, so the alias does not open a prefix match."""
+    host, port = server
+    for path in ("/api/health/", "/api/health/extra", "/api", "/api/healthz"):
+        with pytest.raises(urllib.error.HTTPError) as caught:
+            urllib.request.urlopen(f"http://{host}:{port}{path}", timeout=5)
+        assert caught.value.code == 404, path

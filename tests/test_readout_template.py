@@ -159,16 +159,25 @@ def _proposal_for(left: Claim, right: Claim, clean: Claim) -> ProposedReadout:
 
 def _questions() -> tuple[QuestionView, ...]:
     return (
-        QuestionView(question_id="q-ok", seq=1, text="How is matching done?", state="ok"),
+        QuestionView(
+            question_id="q-ok", seq=1, text="How is matching done?", state="ok", verified_claims=2
+        ),
         QuestionView(
             question_id="q-gap",
             seq=2,
             text="What happens to an invoice that fails the match?",
             state="failed",
+            verified_claims=0,
             error_category="transient",
             is_retryable=True,
         ),
-        QuestionView(question_id="q-missing", seq=3, text="Who owns the queue?", state=None),
+        QuestionView(
+            question_id="q-missing",
+            seq=3,
+            text="Who owns the queue?",
+            state=None,
+            verified_claims=0,
+        ),
     )
 
 
@@ -492,7 +501,11 @@ def test_prose_and_booleans_do_not_become_levels() -> None:
 
 def test_claims_past_the_cap_are_a_stated_prefix() -> None:
     """The synthesis cap and app 17's wall: the message uses the smaller one, and says so."""
-    questions = (QuestionView(question_id="q1", seq=1, text="How is matching done?", state="ok"),)
+    questions = (
+        QuestionView(
+            question_id="q1", seq=1, text="How is matching done?", state="ok", verified_claims=1
+        ),
+    )
     admitted = tuple(
         AdmittedClaim(
             label=f"C{index}",
@@ -513,7 +526,11 @@ def test_claims_past_the_cap_are_a_stated_prefix() -> None:
 
 def test_a_header_that_does_not_fit_is_truncated_out_loud() -> None:
     message, shown, omitted = build_message(
-        (QuestionView(question_id="q1", seq=1, text="x " * 100, state="failed"),),
+        (
+            QuestionView(
+                question_id="q1", seq=1, text="x " * 100, state="failed", verified_claims=0
+            ),
+        ),
         (
             AdmittedClaim(
                 label="C1",

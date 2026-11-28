@@ -115,7 +115,8 @@ jobs:
         # `PORT=9123 wb serve` listens on 9123, and `scripts/smoke.sh --url` passes against it.
         # `tests/test_image.py` pins the Dockerfile directives those two facts combine with.
         run: |
-          id=$(docker run -d -p 8080:8080 wb:ci)
+          # 3000 is the image's PORT, which is what the Lambda adapter forwards to.
+          id=$(docker run -d -p 8080:3000 wb:ci)
           trap 'docker rm -f "$id" >/dev/null 2>&1 || true' EXIT
           for _ in $(seq 1 30); do
             curl -fsS --max-time 2 http://127.0.0.1:8080/healthz >/dev/null 2>&1 && break
@@ -125,12 +126,23 @@ jobs:
           health=$(curl -fsS --max-time 10 http://127.0.0.1:8080/healthz)
           grep -q "^version: 0.1.0$" <<<"$health"
           grep -q "^replay: ok$" <<<"$health"
+          # The platform health path, in the image. deploy/aws.sh curls this one, not /healthz.
+          alias_health=$(curl -fsS --max-time 10 http://127.0.0.1:8080/api/health)
+          [ "$alias_health" = "$health" ]
           map=$(curl -fsS --max-time 10 http://127.0.0.1:8080/)
           grep -q $'^5\.6\t' <<<"$map"
           # Still running after being served, i.e. serve_forever rather than one reply and exit.
           test "$(docker inspect -f '{{.State.Running}}' "$id")" = true
+      - name: The image carries the Lambda Web Adapter
+        # The image deploys as a package_type="Image" Lambda and cannot initialise without the
+        # adapter (issue #29). tests/test_image.py pins the Dockerfile line; this proves the
+        # file is actually in the built image and executable, which the Dockerfile cannot.
+        run: |
+          docker run --rm --entrypoint sh wb:ci -c \
+            'test -x /opt/extensions/lambda-adapter'
       - name: The image takes its port from PORT
         run: |
+          # Overrides the image's PORT=3000, proving the env var still wins.
           id=$(docker run -d -e PORT=9123 -p 9123:9123 wb:ci)
           trap 'docker rm -f "$id" >/dev/null 2>&1 || true' EXIT
           for _ in $(seq 1 30); do
